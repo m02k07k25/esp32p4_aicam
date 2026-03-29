@@ -25,14 +25,14 @@
 #include "driver/jpeg_encode.h"
 #include "mdns.h"
 #include "lwip/apps/netbiosns.h"
-#include "yolo_bridge.h"
+#include "infer_bridge.h"
+#include "infer_config.h"
 
 // video frame buffer count, too large value may cause memory allocation fails.
 #define EXAMPLE_VIDEO_BUFFER_COUNT   2
 #define MEMORY_TYPE                  V4L2_MEMORY_MMAP
 #define CAM_DEV_PATH                 ESP_VIDEO_MIPI_CSI_DEVICE_NAME
 #define JPEG_ENC_QUALITY             (80)
-#define DETECT_JPEG_QUALITY          (60)
 #ifndef ARRAY_SIZE
 #define ARRAY_SIZE(arr) (sizeof(arr) / sizeof(arr[0]))
 #endif
@@ -51,8 +51,6 @@ typedef struct web_cam {
     size_t jpeg_enc_output_buf_alloced_size;
     jpeg_encoder_handle_t jpeg_handle;
     uint8_t *jpeg_out_buf;
-    uint8_t *detect_out_buf;
-    size_t detect_out_buf_capacity;
     uint8_t *buffer[EXAMPLE_VIDEO_BUFFER_COUNT];
 } web_cam_t;
 
@@ -324,24 +322,57 @@ static esp_err_t pic_handler(httpd_req_t *req)
     return res;
 }
 
-static esp_err_t detect_handler(httpd_req_t *req)
+static esp_err_t encode_frame_to_jpeg(web_cam_t *wc,
+                                      const uint8_t *frame_buf,
+                                      size_t frame_len,
+                                      uint8_t jpeg_quality,
+                                      uint8_t **jpeg_ptr,
+                                      size_t *jpeg_len)
+{
+    uint32_t jpeg_encoded_size = 0;
+    jpeg_encode_cfg_t jpeg_cfg = wc->jpeg_enc_config;
+
+    if (wc->pixel_format == V4L2_PIX_FMT_JPEG) {
+        *jpeg_ptr = (uint8_t *)frame_buf;
+        *jpeg_len = frame_len;
+        return ESP_OK;
+    }
+
+    jpeg_cfg.image_quality = jpeg_quality;
+    esp_err_t ret = jpeg_encoder_process(wc->jpeg_handle,
+                                         &jpeg_cfg,
+                                         (uint8_t *)frame_buf,
+                                         frame_len,
+                                         wc->jpeg_out_buf,
+                                         wc->jpeg_enc_output_buf_alloced_size,
+                                         &jpeg_encoded_size);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    *jpeg_ptr = wc->jpeg_out_buf;
+    *jpeg_len = jpeg_encoded_size;
+    return ESP_OK;
+}
+
+static esp_err_t classify_handler(httpd_req_t *req)
 {
     esp_err_t res = ESP_FAIL;
     struct v4l2_buffer buf;
-    size_t detect_jpeg_len = 0;
-    int box_count = 0;
-    float inference_ms = 0;
+    uint8_t *jpeg_ptr = NULL;
+    size_t jpeg_len = 0;
+    infer_result_t infer_result = {0};
     float total_ms = 0;
     web_cam_t *wc = (web_cam_t *)req->user_ctx;
     int64_t req_start_us = esp_timer_get_time();
 
     if (wc->pixel_format != EXAMPLE_VIDEO_FMT_RGB565) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "YOLO handler requires RGB565 camera format");
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Classifier handler requires RGB565 camera format");
         return ESP_FAIL;
     }
 
     httpd_resp_set_type(req, "image/jpeg");
-    httpd_resp_set_hdr(req, "Content-Disposition", "inline; filename=detect.jpg");
+    httpd_resp_set_hdr(req, "Content-Disposition", "inline; filename=classify.jpg");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
 
     memset(&buf, 0, sizeof(buf));
@@ -353,40 +384,45 @@ static esp_err_t detect_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
 
-    res = yolo_bridge_process_rgb565(wc->buffer[buf.index],
-                                     wc->width,
-                                     wc->height,
-                                     DETECT_JPEG_QUALITY,
-                                     &wc->detect_out_buf,
-                                     &detect_jpeg_len,
-                                     &wc->detect_out_buf_capacity,
-                                     &box_count,
-                                     &inference_ms);
+    res = infer_bridge_process_rgb565(wc->buffer[buf.index], wc->width, wc->height, &infer_result);
+    if (res == ESP_OK) {
+        res = encode_frame_to_jpeg(
+            wc, wc->buffer[buf.index], buf.bytesused, INFER_CLASSIFY_JPEG_QUALITY, &jpeg_ptr, &jpeg_len);
+    }
 
     if (ioctl(wc->fd, VIDIOC_QBUF, &buf) != 0) {
         ESP_LOGE(TAG, "failed to free video frame");
     }
 
     if (res != ESP_OK) {
-        ESP_LOGE(TAG, "YOLO detect failed (%s)", esp_err_to_name(res));
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "YOLO detect failed");
+        ESP_LOGE(TAG, "classification failed (%s)", esp_err_to_name(res));
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "classification failed");
         return res;
     }
 
     char hdr_buf[32];
-    snprintf(hdr_buf, sizeof(hdr_buf), "%d", box_count);
-    httpd_resp_set_hdr(req, "X-Detect-Boxes", hdr_buf);
-    snprintf(hdr_buf, sizeof(hdr_buf), "%.2f", inference_ms);
-    httpd_resp_set_hdr(req, "X-Detect-Time-Ms", hdr_buf);
+    snprintf(hdr_buf, sizeof(hdr_buf), "%d", infer_result.class_id);
+    httpd_resp_set_hdr(req, "X-Class-Index", hdr_buf);
+    httpd_resp_set_hdr(req, "X-Class-Label", infer_result.class_name);
+    snprintf(hdr_buf, sizeof(hdr_buf), "%.4f", infer_result.score);
+    httpd_resp_set_hdr(req, "X-Class-Score", hdr_buf);
+    snprintf(hdr_buf, sizeof(hdr_buf), "%.2f", infer_result.inference_ms);
+    httpd_resp_set_hdr(req, "X-Inference-Time-Ms", hdr_buf);
     total_ms = (float)(esp_timer_get_time() - req_start_us) / 1000.0f;
     snprintf(hdr_buf, sizeof(hdr_buf), "%.2f", total_ms);
-    httpd_resp_set_hdr(req, "X-Detect-Total-Ms", hdr_buf);
-    ESP_LOGI(TAG, "detect done: boxes=%d, inference=%.2f ms, total=%.2f ms, jpeg=%u B",
-             box_count, inference_ms, total_ms, (unsigned int)detect_jpeg_len);
+    httpd_resp_set_hdr(req, "X-Inference-Total-Ms", hdr_buf);
+    ESP_LOGI(TAG,
+             "classification done: class=%d (%s), score=%.4f, inference=%.2f ms, total=%.2f ms, jpeg=%u B",
+             infer_result.class_id,
+             infer_result.class_name,
+             infer_result.score,
+             infer_result.inference_ms,
+             total_ms,
+             (unsigned int)jpeg_len);
 
-    res = httpd_resp_send_chunk(req, (const char *)wc->detect_out_buf, detect_jpeg_len);
+    res = httpd_resp_send_chunk(req, (const char *)jpeg_ptr, jpeg_len);
     if (res != ESP_OK) {
-        ESP_LOGE(TAG, "send detect chunk failed");
+        ESP_LOGE(TAG, "send classify chunk failed");
         return res;
     }
 
@@ -418,8 +454,6 @@ static esp_err_t new_web_cam(int cam_fd, web_cam_t **ret_wc)
     wc->width = format.fmt.pix.width;
     wc->height = format.fmt.pix.height;
     wc->pixel_format = format.fmt.pix.pixelformat;
-    wc->detect_out_buf = NULL;
-    wc->detect_out_buf_capacity = 0;
 
     jpeg_enc_input_format_t jpeg_enc_infmt = get_jpeg_enc_input_fmt(format.fmt.pix.pixelformat);
 
@@ -532,10 +566,10 @@ static esp_err_t http_server_init(int index, web_cam_t *web_cam)
         .handler = record_bin_handler,
         .user_ctx = (void *)web_cam,
     };
-    httpd_uri_t detect_get_uri = {
-        .uri = "/detect.jpg",
+    httpd_uri_t classify_get_uri = {
+        .uri = "/classify.jpg",
         .method = HTTP_GET,
-        .handler = detect_handler,
+        .handler = classify_handler,
         .user_ctx = (void *)web_cam
     };
 
@@ -547,9 +581,9 @@ static esp_err_t http_server_init(int index, web_cam_t *web_cam)
 
     ESP_ERROR_CHECK(httpd_register_uri_handler(video_web_httpd, &pic_get_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(video_web_httpd, &record_file_get_uri));
-    ESP_ERROR_CHECK(httpd_register_uri_handler(video_web_httpd, &detect_get_uri));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(video_web_httpd, &classify_get_uri));
 
-    ESP_LOGI(TAG, "Starting HTTP server on port: '%d' (/pic, /record, /detect.jpg)", config.server_port);
+    ESP_LOGI(TAG, "Starting HTTP server on port: '%d' (/pic, /record, /classify.jpg)", config.server_port);
 
     return ESP_OK;
 }
@@ -623,7 +657,7 @@ void app_main(void)
         return;
     }
 
-    ESP_ERROR_CHECK(yolo_bridge_init());
+    ESP_ERROR_CHECK(infer_bridge_init());
     ESP_ERROR_CHECK(start_cam_web_server(index, video_cam_fd));
     ESP_LOGI(TAG, "Example Start");
 }
