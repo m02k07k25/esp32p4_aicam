@@ -1,9 +1,0 @@
-{
-    "idf.currentSetup": "C:\\Users\\m02k0\\esp\\v5.5\\esp-idf",
-    "idf.openOcdConfigs": [
-        "board/esp32p4-builtin.cfg"
-    ],
-    "cmake.configureOnOpen": false,
-    "cmake.buildDirectory": "${workspaceFolder}/build-cmake-tools",
-    "idf.portWin": "COM6"
-}
