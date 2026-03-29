@@ -10,7 +10,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Export the best MobileNetV2 checkpoint to a fixed-shape ONNX graph.")
     parser.add_argument("--checkpoint", type=Path, default=CHECKPOINT_PATH, help="Checkpoint path from train_model.py.")
     parser.add_argument("--output", type=Path, default=ONNX_PATH, help="Output ONNX file.")
-    parser.add_argument("--opset", type=int, default=17, help="ONNX opset version.")
+    parser.add_argument("--opset", type=int, default=18, help="ONNX opset version.")
     parser.add_argument("--device", default="cpu", help='Torch device string. Use "cpu" unless you know you need another target.')
     parser.add_argument("--skip-verify", action="store_true", help="Skip ONNX shape verification after export.")
     return parser.parse_args()

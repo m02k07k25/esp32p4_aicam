@@ -7,8 +7,8 @@ This directory contains the training and export flow for the `224x224` 2-class c
 `labels.txt` is the source of truth for class order. The default labels are:
 
 ```text
-class0
-class1
+no_human
+human
 ```
 
 Keep `labels.txt` aligned with the firmware labels in `main/infer_config.h`.
@@ -46,6 +46,24 @@ python -m pip install --upgrade pip
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
 pip install onnx pillow
 pip install esp-ppq
+```
+
+## COCO Bootstrap
+
+For a quick `human / no_human` bootstrap dataset, use the selective COCO downloader:
+
+```powershell
+python model/prepare_coco_human_dataset.py
+```
+
+This downloads COCO annotations plus only the sampled images you need into `download/`, then copies them into:
+
+```text
+model/data/train/no_human
+model/data/train/human
+model/data/val/no_human
+model/data/val/human
+model/data/calib
 ```
 
 ## Workflow

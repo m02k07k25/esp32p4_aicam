@@ -66,8 +66,8 @@ Shared runtime settings live in `main/infer_config.h`:
 The fixed default labels are:
 
 ```text
-class0
-class1
+no_human
+human
 ```
 
 Keep these aligned with `model/labels.txt`.

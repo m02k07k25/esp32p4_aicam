@@ -1,2 +1,2 @@
-class0
-class1
+no_human
+human

@@ -18,8 +18,8 @@
 extern const uint8_t classifier_224_p4_espdl_start[] asm("_binary_classifier_224_p4_espdl_start");
 
 const char *g_infer_labels[INFER_LABEL_COUNT] = {
-    "class0",
-    "class1",
+    "no_human",
+    "human",
 };
 
 namespace {

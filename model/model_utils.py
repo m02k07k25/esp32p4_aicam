@@ -9,6 +9,8 @@ IMAGENET_STD = (0.229, 0.224, 0.225)
 SUPPORTED_IMAGE_SUFFIXES = {".bmp", ".jpeg", ".jpg", ".png"}
 
 MODEL_ROOT = Path(__file__).resolve().parent
+PROJECT_ROOT = MODEL_ROOT.parent
+DOWNLOAD_ROOT = PROJECT_ROOT / "download"
 DATA_ROOT = MODEL_ROOT / "data"
 TRAIN_ROOT = DATA_ROOT / "train"
 VAL_ROOT = DATA_ROOT / "val"

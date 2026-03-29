@@ -96,7 +96,7 @@ Example response headers:
 
 ```text
 X-Class-Index: 1
-X-Class-Label: class1
+X-Class-Label: human
 X-Class-Score: 0.9821
 X-Inference-Time-Ms: 24.73
 X-Inference-Total-Ms: 38.46

@@ -400,17 +400,21 @@ static esp_err_t classify_handler(httpd_req_t *req)
         return res;
     }
 
-    char hdr_buf[32];
-    snprintf(hdr_buf, sizeof(hdr_buf), "%d", infer_result.class_id);
-    httpd_resp_set_hdr(req, "X-Class-Index", hdr_buf);
+    /* httpd_resp_set_hdr() keeps header value pointers until send time. */
+    char class_id_hdr[32];
+    char score_hdr[32];
+    char inference_ms_hdr[32];
+    char total_ms_hdr[32];
+    snprintf(class_id_hdr, sizeof(class_id_hdr), "%d", infer_result.class_id);
+    httpd_resp_set_hdr(req, "X-Class-Index", class_id_hdr);
     httpd_resp_set_hdr(req, "X-Class-Label", infer_result.class_name);
-    snprintf(hdr_buf, sizeof(hdr_buf), "%.4f", infer_result.score);
-    httpd_resp_set_hdr(req, "X-Class-Score", hdr_buf);
-    snprintf(hdr_buf, sizeof(hdr_buf), "%.2f", infer_result.inference_ms);
-    httpd_resp_set_hdr(req, "X-Inference-Time-Ms", hdr_buf);
+    snprintf(score_hdr, sizeof(score_hdr), "%.4f", infer_result.score);
+    httpd_resp_set_hdr(req, "X-Class-Score", score_hdr);
+    snprintf(inference_ms_hdr, sizeof(inference_ms_hdr), "%.2f", infer_result.inference_ms);
+    httpd_resp_set_hdr(req, "X-Inference-Time-Ms", inference_ms_hdr);
     total_ms = (float)(esp_timer_get_time() - req_start_us) / 1000.0f;
-    snprintf(hdr_buf, sizeof(hdr_buf), "%.2f", total_ms);
-    httpd_resp_set_hdr(req, "X-Inference-Total-Ms", hdr_buf);
+    snprintf(total_ms_hdr, sizeof(total_ms_hdr), "%.2f", total_ms);
+    httpd_resp_set_hdr(req, "X-Inference-Total-Ms", total_ms_hdr);
     ESP_LOGI(TAG,
              "classification done: class=%d (%s), score=%.4f, inference=%.2f ms, total=%.2f ms, jpeg=%u B",
              infer_result.class_id,

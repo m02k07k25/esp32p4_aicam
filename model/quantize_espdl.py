@@ -14,7 +14,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, default=ESPDL_PATH, help="Output .espdl file.")
     parser.add_argument("--target", default="esp32p4", help="ESP-PPQ target platform.")
     parser.add_argument("--bits", type=int, default=8, choices=[8], help="Quantization bits.")
-    parser.add_argument("--batch-size", type=int, default=32, help="Calibration batch size.")
+    parser.add_argument("--batch-size", type=int, default=1, help="Calibration batch size. Use 1 for the fixed-shape ONNX export.")
     parser.add_argument("--calib-steps", type=int, default=32, help="Maximum calibration steps.")
     parser.add_argument("--workers", type=int, default=0, help="DataLoader worker processes.")
     parser.add_argument("--device", default="cpu", help='Torch device string. Keep this at "cpu" for a CPU-only .venv.')
@@ -45,6 +45,9 @@ def import_ppq():
 def main() -> None:
     args = parse_args()
     QuantizationSettingFactory, espdl_quantize_onnx = import_ppq()
+
+    if args.batch_size != 1:
+        raise ValueError("This quantization flow expects a fixed-shape ONNX input of [1, 3, 224, 224], so --batch-size must be 1.")
 
     import torch
     from PIL import Image

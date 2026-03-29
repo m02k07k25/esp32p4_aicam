@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2024-2025 Espressif Systems (Shanghai) CO LTD
+ * SPDX-FileCopyrightText: 2024-2026 Espressif Systems (Shanghai) CO LTD
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -13,6 +13,36 @@
 #include "uvc_descriptors_priv.h"
 
 #define FLOAT_EQUAL(a, b) (fabsf(a - b) < 0.0001f) // For comparing float values with acceptable difference (epsilon value)
+
+/**
+ * @brief Get the safe wTotalLength for VS interface header parsing
+ *
+ * The wTotalLength field in the VS Input Header comes from the device and could
+ * be larger than the actual config descriptor, causing out-of-bounds reads.
+ * This function returns the minimum of wTotalLength and the remaining bytes
+ * in the config descriptor from the header position.
+ *
+ * @param[in] cfg_desc   Configuration descriptor
+ * @param[in] header     VS Input Header descriptor
+ * @return Safe wTotalLength value clamped to config descriptor bounds
+ */
+static inline uint16_t uvc_desc_get_safe_wTotalLength(const usb_config_desc_t *cfg_desc, const uvc_vs_input_header_desc_t *header)
+{
+    uintptr_t cfg_start = (uintptr_t)cfg_desc;
+    uintptr_t header_start = (uintptr_t)header;
+    if (header_start <= cfg_start) {
+        return 0;
+    }
+    const size_t offset = (size_t)(header_start - cfg_start);
+    if (offset >= cfg_desc->wTotalLength) {
+        return 0;
+    }
+    size_t remaining = cfg_desc->wTotalLength - offset;
+    if (header->wTotalLength > remaining) {
+        return remaining;
+    }
+    return header->wTotalLength;
+}
 
 static const uvc_vs_input_header_desc_t *uvc_desc_get_streaming_input_header(const usb_config_desc_t *cfg_desc, uint8_t bInterfaceNumber)
 {
@@ -49,7 +79,6 @@ esp_err_t uvc_desc_get_streaming_intf_and_ep(
 
     const uint8_t num_of_alternate = usb_parse_interface_number_of_alternate(cfg_desc, bInterfaceNumber);
     uint16_t last_mps = 0; // Looking for maximum MPS: init to zero
-    uint8_t last_mult = UINT8_MAX; // Looking for minimum: init to max
     for (int i = 0; i <= num_of_alternate; i++) {
         // Check Interface desc
         intf_desc = usb_parse_interface_descriptor(cfg_desc, bInterfaceNumber, i, &offset);
@@ -65,13 +94,11 @@ esp_err_t uvc_desc_get_streaming_intf_and_ep(
         ep_desc = usb_parse_endpoint_descriptor_by_index(intf_desc, 0, cfg_desc->wTotalLength, &offset);
         UVC_CHECK(ep_desc, ESP_ERR_NOT_FOUND);
 
-        // Here we look for an interface that offers the largest MPS with minimum multiple transactions in a microframe
-        // and that is not bigger that max. requests MPS
-        const uint16_t current_mps = USB_EP_DESC_GET_MPS(ep_desc);
-        const uint8_t current_mult = USB_EP_DESC_GET_MULT(ep_desc);
-        if (current_mps >= last_mps && current_mult <= last_mult && current_mps <= dwMaxPayloadTransferSize) {
+        // Here we look for an interface that offers the largest MPS that is not larger than requested MPS
+        const uint8_t packets_per_frame = USB_EP_DESC_GET_MULT(ep_desc) + 1;
+        const uint16_t current_mps = USB_EP_DESC_GET_MPS(ep_desc) * packets_per_frame;
+        if (current_mps >= last_mps && current_mps <= dwMaxPayloadTransferSize) {
             last_mps = current_mps;
-            last_mult = current_mult;
             *ep_desc_ret = ep_desc;
             *intf_desc_ret = intf_desc;
             ret = ESP_OK;
@@ -243,12 +270,13 @@ esp_err_t uvc_desc_get_frame_format_by_format(
 
     const uvc_vs_input_header_desc_t *input_header = uvc_desc_get_streaming_input_header(cfg_desc, bInterfaceNumber);
     UVC_CHECK(input_header, ESP_ERR_NOT_FOUND);
+    const uint16_t safe_wTotalLength = uvc_desc_get_safe_wTotalLength(cfg_desc, input_header);
 
     // Find requested Format descriptors
     esp_err_t ret = ESP_ERR_NOT_FOUND;
     int format_offset = 0;
     const usb_standard_desc_t *current_desc = (const usb_standard_desc_t *) input_header;
-    while ((current_desc = usb_parse_next_descriptor_of_type(current_desc, input_header->wTotalLength, UVC_CS_INTERFACE, &format_offset))) {
+    while ((current_desc = usb_parse_next_descriptor_of_type(current_desc, safe_wTotalLength, UVC_CS_INTERFACE, &format_offset))) {
         if (uvc_desc_is_format_desc(current_desc)) {
             const uvc_format_desc_t *this_format = (const uvc_format_desc_t *)(current_desc);
             if (vs_format->format == uvc_desc_parse_format(this_format)) {
@@ -257,7 +285,7 @@ esp_err_t uvc_desc_get_frame_format_by_format(
                 }
                 // We found required Format Descriptor
                 // Now we look for correct Frame Descriptors which should be directly after Format
-                while ((current_desc = usb_parse_next_descriptor_of_type(current_desc, input_header->wTotalLength, UVC_CS_INTERFACE, &format_offset))) {
+                while ((current_desc = usb_parse_next_descriptor_of_type(current_desc, safe_wTotalLength, UVC_CS_INTERFACE, &format_offset))) {
                     uvc_frame_desc_t *this_frame = (uvc_frame_desc_t *)current_desc;
                     if (uvc_desc_format_is_equal(this_frame, vs_format)) {
                         if (frame_desc_ret) {
@@ -326,12 +354,13 @@ esp_err_t uvc_desc_get_frame_format_by_index(
 
     const uvc_vs_input_header_desc_t *input_header = uvc_desc_get_streaming_input_header(cfg_desc, bInterfaceNumber);
     UVC_CHECK(input_header, ESP_ERR_NOT_FOUND);
+    const uint16_t safe_wTotalLength = uvc_desc_get_safe_wTotalLength(cfg_desc, input_header);
 
     // Find requested Format and Frame descriptors
     esp_err_t ret = ESP_ERR_NOT_FOUND;
     int format_offset = 0;
     const usb_standard_desc_t *current_desc = (const usb_standard_desc_t *) input_header;
-    while ((current_desc = usb_parse_next_descriptor_of_type(current_desc, input_header->wTotalLength, UVC_CS_INTERFACE, &format_offset))) {
+    while ((current_desc = usb_parse_next_descriptor_of_type(current_desc, safe_wTotalLength, UVC_CS_INTERFACE, &format_offset))) {
         if (uvc_desc_is_format_desc(current_desc)) {
             const uvc_format_desc_t *this_format = (const uvc_format_desc_t *)current_desc;
             if (this_format->bFormatIndex == bFormatIndex) {
@@ -339,7 +368,7 @@ esp_err_t uvc_desc_get_frame_format_by_index(
                 *format_desc_ret = (const uvc_format_desc_t *)this_format;
                 // We found required Format Descriptor
                 // Now we look for correct Frame Descriptors which should be directly after Format
-                while ((current_desc = usb_parse_next_descriptor_of_type(current_desc, input_header->wTotalLength, UVC_CS_INTERFACE, &format_offset))) {
+                while ((current_desc = usb_parse_next_descriptor_of_type(current_desc, safe_wTotalLength, UVC_CS_INTERFACE, &format_offset))) {
                     uvc_frame_desc_t *this_frame = (uvc_frame_desc_t *)current_desc;
                     if (this_frame->bFrameIndex == bFrameIndex) {
                         *frame_desc_ret = this_frame;
@@ -410,15 +439,18 @@ esp_err_t uvc_desc_get_frame_list(const usb_config_desc_t *config_desc, uint8_t 
 
     const uvc_vc_header_desc_t *vc_header = uvc_desc_get_control_interface_header(config_desc, uvc_index);
     UVC_CHECK(vc_header, ESP_ERR_NOT_FOUND);
+    UVC_CHECK(vc_header->bInCollection > 0, ESP_ERR_NOT_FOUND);
 
     // Find requested Format descriptors
     const usb_standard_desc_t *current_desc = (const usb_standard_desc_t *)vc_header;
     // Skip VC Interface Header and VC Interface Descriptor
     int format_offset = 0;
     const uvc_vs_input_header_desc_t *vs_header = uvc_desc_get_streaming_input_header(config_desc, vc_header->baInterfaceNr[0]);
+    UVC_CHECK(vs_header, ESP_ERR_NOT_FOUND);
+    const uint16_t safe_wTotalLength = uvc_desc_get_safe_wTotalLength(config_desc, vs_header);
     current_desc = (const usb_standard_desc_t *)vs_header;
 
-    while ((current_desc = usb_parse_next_descriptor_of_type(current_desc, vs_header->wTotalLength, UVC_CS_INTERFACE, &format_offset))) {
+    while ((current_desc = usb_parse_next_descriptor_of_type(current_desc, safe_wTotalLength, UVC_CS_INTERFACE, &format_offset))) {
         if (!uvc_desc_is_format_desc(current_desc)) {
             continue;
         }
@@ -438,7 +470,7 @@ esp_err_t uvc_desc_get_frame_list(const usb_config_desc_t *config_desc, uint8_t 
 
         // We found required Format Descriptor
         // Now we look for correct Frame Descriptors which should be directly after Format
-        while ((current_desc = usb_parse_next_descriptor_of_type(current_desc, vs_header->wTotalLength, UVC_CS_INTERFACE, &format_offset))) {
+        while ((current_desc = usb_parse_next_descriptor_of_type(current_desc, safe_wTotalLength, UVC_CS_INTERFACE, &format_offset))) {
             if (!uvc_desc_is_frame_desc(current_desc)) {
                 break;
             }

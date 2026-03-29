@@ -82,14 +82,6 @@ dependencies:
       registry_url: https://components.espressif.com/
       type: service
     version: 0.5.3
-  espressif/coco_detect:
-    dependencies:
-    - name: espressif/esp-dl
-      version: ~3.2.0
-    source:
-      path: C:\Users\m02k0\Desktop\Cording\esp_idf\yolo11_detect\managed_components\espressif__coco_detect
-      type: local
-    version: 0.3.0
   espressif/dl_fft:
     dependencies:
     - name: idf
@@ -149,7 +141,7 @@ dependencies:
       type: service
     version: 1.0.4
   espressif/esp_hosted:
-    component_hash: 9eea9ce83444a412b4a02311f787f3639a5d29fe67e6df83863010dd68ab250b
+    component_hash: e23eb702781c804a62909e5394da0641a2bff9adccec6673a7bff60ce8c8b756
     dependencies:
     - name: idf
       require: private
@@ -157,7 +149,7 @@ dependencies:
     source:
       registry_url: https://components.espressif.com
       type: service
-    version: 2.12.0
+    version: 2.12.3
   espressif/esp_new_jpeg:
     dependencies: []
     source:
@@ -214,7 +206,7 @@ dependencies:
       type: service
     version: 1.9.1
   espressif/usb_host_uvc:
-    component_hash: 197eae0d1dd5ddec773704653e0ff70e81126b8ccdb62e034ed239f755adb48c
+    component_hash: f20c4e4dea50536e2e29daaf589b5f5984402284c155867daef27d6b64869f78
     dependencies:
     - name: idf
       require: private
@@ -235,21 +227,21 @@ dependencies:
     - esp32p4
     - esp32h4
     - linux
-    version: 2.4.1
+    version: 2.4.2
   espressif/wifi_remote_over_eppp:
-    component_hash: ac4d13625cc9f88597cd612d2758580fac287d8ec731b606f2a0720d28cda6cd
+    component_hash: 06d8bc15348bbd21f1390daace36ed5adcf6026c93c5b69decc55fa04df2711a
     dependencies:
+    - name: idf
+      require: private
+      version: '>=5.3'
     - name: espressif/eppp_link
       registry_url: https://components.espressif.com
       require: private
       version: '>=0.1'
-    - name: idf
-      require: private
-      version: '>=5.3'
     source:
       registry_url: https://components.espressif.com
       type: service
-    version: 0.3.1
+    version: 0.3.2
   idf:
     source:
       type: idf
@@ -262,7 +254,6 @@ dependencies:
     version: '*'
 direct_dependencies:
 - esp_video
-- espressif/coco_detect
 - espressif/dl_fft
 - espressif/esp-dl
 - espressif/esp-dsp
@@ -271,6 +262,6 @@ direct_dependencies:
 - espressif/mdns
 - idf
 - protocol_examples_common
-manifest_hash: afb55ddac296cb10cde7777015455f67ee643b2b34df96137a16b544b588e1f8
+manifest_hash: 3a03904a42c59e92cb6abe3451de8bd4297f2c43e940bc7642580dd25510c65a
 target: esp32p4
 version: 2.0.0
