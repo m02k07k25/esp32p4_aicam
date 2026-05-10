@@ -24,3 +24,4 @@ model/data/val/*
 *.png
 build/
 dist/
+build*
