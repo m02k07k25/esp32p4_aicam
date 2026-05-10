@@ -1,6 +1,7 @@
 set(srcs
     "simple_video_server_example.c"
-    "yolo_bridge.cpp")
+    "yolo_bridge.cpp"
+    "model_data.cc")
 
 idf_component_register(SRCS "${srcs}"
                        PRIV_INCLUDE_DIRS .
