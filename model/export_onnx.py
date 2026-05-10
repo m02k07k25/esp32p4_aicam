@@ -3,11 +3,21 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from model_utils import CHECKPOINT_PATH, IMAGE_SIZE, NUM_CLASSES, ONNX_PATH, build_model, checkpoint_state_dict, ensure_parent_dir, load_labels
+from model_utils import (
+    CHECKPOINT_PATH,
+    IMAGE_SIZE,
+    MODEL_WIDTH_MULT,
+    NUM_CLASSES,
+    ONNX_PATH,
+    build_model,
+    checkpoint_state_dict,
+    ensure_parent_dir,
+    load_labels,
+)
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Export the best MobileNetV2 checkpoint to a fixed-shape ONNX graph.")
+    parser = argparse.ArgumentParser(description="Export the best MobileNetV2 0.35-width checkpoint to a fixed-shape ONNX graph.")
     parser.add_argument("--checkpoint", type=Path, default=CHECKPOINT_PATH, help="Checkpoint path from train_model.py.")
     parser.add_argument("--output", type=Path, default=ONNX_PATH, help="Output ONNX file.")
     parser.add_argument("--opset", type=int, default=18, help="ONNX opset version.")
@@ -36,9 +46,20 @@ def main() -> None:
     checkpoint_labels = checkpoint.get("labels", labels)
     if checkpoint_labels != labels:
         raise ValueError(f"Checkpoint labels {checkpoint_labels} do not match {labels}.")
+    checkpoint_width_mult = checkpoint.get("width_mult")
+    if checkpoint_width_mult is not None and float(checkpoint_width_mult) != MODEL_WIDTH_MULT:
+        raise ValueError(
+            f"Checkpoint width_mult={checkpoint_width_mult} does not match current width_mult={MODEL_WIDTH_MULT}."
+        )
 
     model = build_model(num_classes=NUM_CLASSES, pretrained=False)
-    model.load_state_dict(checkpoint_state_dict(checkpoint))
+    try:
+        model.load_state_dict(checkpoint_state_dict(checkpoint))
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"Failed to load checkpoint into MobileNetV2 width_mult={MODEL_WIDTH_MULT}. "
+            "Retrain the classifier before exporting; older checkpoints may be width_mult=1.0."
+        ) from exc
     model.eval()
     model.to(torch.device(args.device))
 

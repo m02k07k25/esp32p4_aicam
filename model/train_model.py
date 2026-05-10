@@ -8,6 +8,7 @@ from model_utils import (
     IMAGE_SIZE,
     IMAGENET_MEAN,
     IMAGENET_STD,
+    MODEL_WIDTH_MULT,
     NUM_CLASSES,
     TRAIN_ROOT,
     VAL_ROOT,
@@ -21,7 +22,7 @@ from model_utils import (
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train a 2-class MobileNetV2 classifier for ESP-DL export.")
+    parser = argparse.ArgumentParser(description="Train a 2-class MobileNetV2 0.35-width classifier for ESP-DL export.")
     parser.add_argument("--train-dir", type=Path, default=TRAIN_ROOT, help="Training data root.")
     parser.add_argument("--val-dir", type=Path, default=VAL_ROOT, help="Validation data root.")
     parser.add_argument("--output", type=Path, default=CHECKPOINT_PATH, help="Best-checkpoint output path.")
@@ -59,6 +60,7 @@ def save_checkpoint(
 
     checkpoint = {
         "model_name": "mobilenet_v2",
+        "width_mult": MODEL_WIDTH_MULT,
         "image_size": IMAGE_SIZE,
         "labels": labels,
         "class_to_idx": class_to_idx,

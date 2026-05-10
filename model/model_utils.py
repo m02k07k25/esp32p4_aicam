@@ -4,6 +4,7 @@ from pathlib import Path
 
 IMAGE_SIZE = 224
 NUM_CLASSES = 2
+MODEL_WIDTH_MULT = 0.35
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 SUPPORTED_IMAGE_SUFFIXES = {".bmp", ".jpeg", ".jpg", ".png"}
@@ -68,13 +69,26 @@ def build_transforms(train: bool):
     return transforms.Compose(ops)
 
 
-def build_model(num_classes: int = NUM_CLASSES, pretrained: bool = True):
+def build_model(num_classes: int = NUM_CLASSES, pretrained: bool = True, width_mult: float = MODEL_WIDTH_MULT):
+    import math
+    import warnings
+
     import torch.nn as nn
     import torchvision
     from torchvision.models import MobileNet_V2_Weights
 
-    weights = MobileNet_V2_Weights.IMAGENET1K_V1 if pretrained else None
-    model = torchvision.models.mobilenet_v2(weights=weights)
+    weights = None
+    if pretrained:
+        if math.isclose(width_mult, 1.0):
+            weights = MobileNet_V2_Weights.IMAGENET1K_V1
+        else:
+            warnings.warn(
+                "torchvision MobileNetV2 pretrained weights are only compatible with width_mult=1.0; "
+                f"training width_mult={width_mult} from random initialization.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+    model = torchvision.models.mobilenet_v2(weights=weights, width_mult=width_mult)
     in_features = model.classifier[1].in_features
     model.classifier[1] = nn.Linear(in_features, num_classes)
     return model

@@ -1,28 +1,47 @@
-| Supported Targets | ESP32-P4 |
-| ----------------- | -------- |
+| 지원 대상 | ESP32-P4 |
+| --------- | -------- |
 
-# Simple Video Server Classifier Example
+# Simple Video Server Classifier 예제
 
-## Overview
+## 빠른 실행 순서
 
-This project serves one-shot camera frames over HTTP and runs a local `224x224` image classifier on demand.
+모델 파일이 이미 있으면 바로 빌드와 플래시를 진행할 수 있습니다.
 
-The current default assumptions are:
+```powershell
+idf.py -p PORT build flash monitor
+```
 
-- camera sensor: `OV5647`
-- capture format: `800x800` sensor frame, converted to `RGB565`
-- classifier input: `224x224`
-- model type: 2-class MobileNetV2-style classifier exported as `classifier_224_p4.espdl`
+모델 파일을 새로 만들어야 한다면 먼저 아래 순서로 실행합니다.
 
-Available HTTP endpoints:
+```powershell
+python model/train_model.py --epochs 20
+python model/export_onnx.py
+python model/quantize_espdl.py
+idf.py -p PORT build flash monitor
+```
 
-| URL | Method | Description |
-| --- | ------ | ----------- |
-| `/pic` | `GET` | Returns the latest frame as `capture.jpg`. |
-| `/record` | `GET` | Returns the raw frame bytes from the current camera buffer. |
-| `/classify.jpg` | `GET` | Runs classification on the current frame, returns the original frame as JPEG, and attaches the classification result in HTTP headers. |
+모델 학습용 Python 환경과 데이터셋 준비 방법은 [model/README.md](model/README.md)를 확인하세요.
 
-Classification headers returned by `/classify.jpg`:
+## 개요
+
+이 프로젝트는 ESP32-P4에서 카메라 프레임을 HTTP로 제공하고, 요청이 들어올 때 로컬 `224x224` 이미지 분류 모델을 실행합니다.
+
+현재 기본 전제는 다음과 같습니다.
+
+- 카메라 센서: `OV5647`
+- 캡처 포맷: `800x800` 센서 프레임을 `RGB565`로 변환
+- 분류기 입력: `224x224`
+- 모델 타입: `classifier_224_p4.espdl`로 변환된 2클래스 MobileNetV2 0.35-width 분류기
+
+## HTTP 엔드포인트
+
+| URL | Method | 설명 |
+| --- | ------ | ---- |
+| `/pic` | `GET` | 최신 프레임을 `capture.jpg`로 반환합니다. |
+| `/record` | `GET` | 현재 카메라 버퍼의 원본 프레임 바이트를 반환합니다. |
+| `/classify.jpg` | `GET` | 현재 프레임을 분류하고, 원본 프레임 JPEG와 분류 결과 헤더를 반환합니다. |
+
+`/classify.jpg` 응답에는 다음 헤더가 포함됩니다.
 
 - `X-Class-Index`
 - `X-Class-Label`
@@ -30,69 +49,48 @@ Classification headers returned by `/classify.jpg`:
 - `X-Inference-Time-Ms`
 - `X-Inference-Total-Ms`
 
-The application does not draw overlays on the classified image. The response JPEG is the original frame.
+분류 결과는 이미지 위에 오버레이로 그리지 않습니다. 응답 JPEG는 원본 프레임입니다.
 
-## Model Asset Requirement
+## 모델 파일
 
-The firmware build embeds the classifier model directly from:
+펌웨어 빌드는 아래 ESP-DL 모델 파일을 직접 임베드합니다.
 
 ```text
 model/artifacts/espdl/classifier_224_p4.espdl
 ```
 
-If that file does not exist, CMake fails early with a clear error. Generate it with the scripts under `model/` before building the firmware.
+이 파일이 없으면 `main/CMakeLists.txt`에서 빌드가 중단됩니다. 펌웨어를 빌드하기 전에 `model/` 아래 스크립트로 모델을 생성해야 합니다.
 
-## Model Workflow
+## 프로젝트 설정
 
-The `model/` directory is a separate Python workspace for classifier training and export. Use a project-local `.venv` for this flow. Do not change the ESP-IDF Python interpreter.
-
-Typical sequence:
+설정 메뉴는 다음 명령으로 엽니다.
 
 ```powershell
-python model/train_model.py --epochs 20
-python model/export_onnx.py
-python model/quantize_espdl.py
-```
-
-See `model/README.md` for dataset layout and dependency setup.
-
-## Configure the Project
-
-Open the project configuration menu:
-
-```text
 idf.py menuconfig
 ```
 
-Important expectations for this refactor:
+중요한 기본 설정은 다음과 같습니다.
 
-- the camera sensor should stay on the `OV5647` path
-- the default sensor format should stay at `RAW8 800x800`
-- the application will request `RGB565` output from the video device before JPEG encode and classification
+- 카메라 센서는 `OV5647` 경로를 사용합니다.
+- 기본 센서 포맷은 `RAW8 800x800`입니다.
+- 앱은 JPEG 인코딩과 분류 전에 비디오 장치 출력 포맷을 `RGB565`로 요청합니다.
+- Wi-Fi Remote를 사용할 경우 ESP32-P4는 ESP32-C6와 ESP-Hosted SDIO로 통신합니다.
 
-## Build and Flash
+## 요청 예시
 
-After the `.espdl` model exists, build and flash as usual:
-
-```text
-idf.py -p PORT flash monitor
-```
-
-## Example Requests
-
-Fetch a plain JPEG:
+일반 JPEG를 가져옵니다.
 
 ```bash
 curl http://esp-web.local/pic > capture.jpg
 ```
 
-Fetch a classified frame and inspect headers:
+분류 결과 헤더를 확인합니다.
 
 ```bash
 curl -i http://esp-web.local/classify.jpg
 ```
 
-Example response headers:
+응답 헤더 예시는 다음과 같습니다.
 
 ```text
 X-Class-Index: 1
@@ -102,8 +100,8 @@ X-Inference-Time-Ms: 24.73
 X-Inference-Total-Ms: 38.46
 ```
 
-## Notes
+## 참고
 
-- The runtime preprocess path is a direct resize from the square camera frame to `224x224`.
-- The firmware normalization matches torchvision ImageNet normalization using 0-255-scaled mean and std.
-- `labels.txt` and `main/infer_config.h` must keep the same 2-label order.
+- 런타임 전처리는 정사각형 카메라 프레임을 `224x224`로 리사이즈합니다.
+- 펌웨어 정규화 값은 torchvision ImageNet normalization과 맞춰져 있습니다.
+- `model/labels.txt`와 `main/infer_config.h`의 2개 라벨 순서는 항상 같아야 합니다.
