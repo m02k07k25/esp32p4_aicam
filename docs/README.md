@@ -20,7 +20,7 @@ python model/quantize_espdl.py
 idf.py -p PORT build flash monitor
 ```
 
-모델 학습용 Python 환경과 데이터셋 준비 방법은 [model/README.md](model/README.md)를 확인하세요.
+모델 학습용 Python 환경과 데이터셋 준비 방법은 [model.md](model.md)를 확인하세요.
 
 ## 개요
 
@@ -75,6 +75,7 @@ idf.py menuconfig
 - 기본 센서 포맷은 `RAW8 800x800`입니다.
 - 앱은 JPEG 인코딩과 분류 전에 비디오 장치 출력 포맷을 `RGB565`로 요청합니다.
 - Wi-Fi Remote를 사용할 경우 ESP32-P4는 ESP32-C6와 ESP-Hosted SDIO로 통신합니다.
+- `/classify.jpg` 처리 후 JPEG와 추론 결과를 C6로 보내는 SDIO custom data 프로토콜은 [sdio_frame_transfer.md](sdio_frame_transfer.md)를 확인하세요.
 
 ## 요청 예시
 

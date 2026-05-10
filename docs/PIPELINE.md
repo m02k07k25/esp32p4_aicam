@@ -49,6 +49,7 @@ OV5647 sensor
   -> infer_bridge preprocesses 800x800 RGB565 -> 224x224 tensor
   -> MobileNetV2 0.35-width classifier runs with esp-dl
   -> top-1 class is returned through HTTP headers
+  -> JPEG and classification metadata are chunked and sent to C6 over ESP-Hosted custom data
   -> the original frame is JPEG-encoded and returned as classify.jpg
   -> V4L2 buffer is queued back to the driver
 ```
@@ -98,3 +99,9 @@ quantize_espdl.py
 ```
 
 학습, ONNX 내보내기, 양자화, 펌웨어 전처리 경로는 모두 같은 `224x224` 리사이즈 정책과 ImageNet normalization 값을 사용합니다.
+
+## SDIO 전송
+
+`/classify.jpg` 처리 후 P4는 `main/sdio_frame_tx.c`를 통해 JPEG와 추론 결과를 C6로 전송합니다. JPEG는 ESP-Hosted custom data 한도를 넘을 수 있어서 `sdio_frame_chunk_header_t` 헤더가 붙은 여러 chunk로 나뉩니다.
+
+C6 쪽 수신 callback 예시는 [sdio_frame_transfer.md](sdio_frame_transfer.md)에 있습니다.

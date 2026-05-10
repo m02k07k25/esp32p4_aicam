@@ -27,6 +27,7 @@
 #include "lwip/apps/netbiosns.h"
 #include "infer_bridge.h"
 #include "infer_config.h"
+#include "sdio_frame_tx.h"
 
 // video frame buffer count, too large value may cause memory allocation fails.
 #define EXAMPLE_VIDEO_BUFFER_COUNT   2
@@ -423,6 +424,11 @@ static esp_err_t classify_handler(httpd_req_t *req)
              infer_result.inference_ms,
              total_ms,
              (unsigned int)jpeg_len);
+
+    esp_err_t sdio_ret = sdio_frame_tx_send_classification(jpeg_ptr, jpeg_len, &infer_result, total_ms);
+    if (sdio_ret != ESP_OK) {
+        ESP_LOGW(TAG, "SDIO frame send skipped/failed: %s", esp_err_to_name(sdio_ret));
+    }
 
     res = httpd_resp_send_chunk(req, (const char *)jpeg_ptr, jpeg_len);
     if (res != ESP_OK) {
