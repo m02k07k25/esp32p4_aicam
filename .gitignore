@@ -25,3 +25,5 @@ model/data/val/*
 build/
 dist/
 build*
+sdkconfig
+sdkconfig.old
