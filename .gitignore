@@ -24,3 +24,6 @@ model/data/val/*
 *.png
 build/
 dist/
+build*
+sdkconfig
+sdkconfig.old
