@@ -1,0 +1,17 @@
+dependencies:
+  esp_video:
+    path: ../../esp-video-components/esp_video
+  espressif/esp-dl:
+    path: ../../yolo11_detect/managed_components/espressif__esp-dl
+  espressif/dl_fft:
+    path: ../../yolo11_detect/managed_components/espressif__dl_fft
+  espressif/esp-dsp:
+    path: ../../yolo11_detect/managed_components/espressif__esp-dsp
+  espressif/esp_new_jpeg:
+    path: ../../yolo11_detect/managed_components/espressif__esp_new_jpeg
+  esp_wifi_remote:
+    version: '*'
+  espressif/mdns: ^1.0.3
+  idf: '>=5.3'
+  protocol_examples_common:
+    path: ${IDF_PATH}/examples/common_components/protocol_examples_common
