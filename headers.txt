@@ -1,0 +1,11 @@
+HTTP/1.1 200 OK
+Content-Type: image/jpeg
+Transfer-Encoding: chunked
+Content-Disposition: inline; filename=classify.jpg
+Access-Control-Allow-Origin: *
+X-Class-Index: 1037.13
+X-Class-Label: human
+X-Class-Score: 1037.13
+X-Inference-Time-Ms: 1037.13
+X-Inference-Total-Ms: 1037.13
+
