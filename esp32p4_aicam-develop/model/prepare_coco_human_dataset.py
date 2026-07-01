@@ -122,7 +122,7 @@ def sample_image_infos(coco: dict, person_id: int, class_label: str, sample_coun
                 max_ratio = person_area_ratio
 
 # 가장 큰 사람 기준으로 판단
-        if max_ratio <= 0.15:
+        if max_ratio <= 0.3:
             filtered_human_ids.append(image_id)
 
     human_ids = set(image_to_person_boxes.keys())
