@@ -4,20 +4,31 @@
  * SPDX-License-Identifier: ESPRESSIF MIT
  */
 #include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <inttypes.h>
+#include <dirent.h>
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/param.h>
 #include <sys/errno.h>
+#include <unistd.h>
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "esp_event.h"
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_netif.h"
 #include "esp_timer.h"
+#include "esp_vfs_fat.h"
+#include "esp_wifi.h"
 #include "nvs_flash.h"
 #include "esp_http_server.h"
 #include "sdkconfig.h"
-#include "protocol_examples_common.h"
+#include "sdmmc_cmd.h"
+#include "driver/sdmmc_host.h"
 #include "linux/videodev2.h"
 #include "esp_video_init.h"
 #include "esp_video_device.h"
@@ -40,6 +51,17 @@
 #endif
 #define EXAMPLE_MDNS_INSTANCE "simple video web"
 #define EXAMPLE_MDNS_HOST_NAME "esp-web"
+#define DATA_AP_SSID "esp32p4-data"
+#define DATA_AP_PASSWORD "12345678"
+#define DATA_AP_CHANNEL 1
+#define DATA_AP_MAX_CONN 4
+#define CAPTURE_MOUNT_POINT "/sdcard"
+#define CAPTURE_DIR CAPTURE_MOUNT_POINT "/captures"
+#define CAPTURE_NAME_PREFIX "IMG_"
+#define CAPTURE_NAME_DIGITS 6
+#define CAPTURE_FILE_EXT ".jpg"
+#define CAPTURE_FILENAME_MAX_LEN 16
+#define CAPTURE_PATH_MAX_LEN 64
 
 /*
  * Web cam control structure
@@ -54,6 +76,7 @@ typedef struct web_cam {
     jpeg_encoder_handle_t jpeg_handle;
     uint8_t *jpeg_out_buf;
     uint8_t *buffer[EXAMPLE_VIDEO_BUFFER_COUNT];
+    SemaphoreHandle_t lock;
 } web_cam_t;
 
 /*
@@ -71,6 +94,12 @@ typedef enum {
 
 const int s_queue_buf_type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 static const char *TAG = "example";
+static sdmmc_card_t *s_sd_card;
+static bool s_capture_storage_mounted;
+static uint32_t s_next_capture_index = 1;
+static SemaphoreHandle_t s_capture_index_lock;
+
+typedef esp_err_t (*jpeg_frame_consumer_t)(const uint8_t *jpeg, size_t jpeg_len, void *ctx);
 
 static void app_tune_task_wdt(void)
 {
@@ -87,6 +116,166 @@ static void app_tune_task_wdt(void)
         ESP_LOGW(TAG, "Task WDT reconfigure failed: %s", esp_err_to_name(err));
     }
 #endif
+}
+
+static bool is_capture_filename(const char *name)
+{
+    if (name == NULL) {
+        return false;
+    }
+
+    size_t name_len = strlen(name);
+    size_t expected_len = strlen(CAPTURE_NAME_PREFIX) + CAPTURE_NAME_DIGITS + strlen(CAPTURE_FILE_EXT);
+    if (name_len != expected_len) {
+        return false;
+    }
+
+    if (strncmp(name, CAPTURE_NAME_PREFIX, strlen(CAPTURE_NAME_PREFIX)) != 0) {
+        return false;
+    }
+
+    const char *digits = name + strlen(CAPTURE_NAME_PREFIX);
+    for (int i = 0; i < CAPTURE_NAME_DIGITS; i++) {
+        if (digits[i] < '0' || digits[i] > '9') {
+            return false;
+        }
+    }
+
+    return strcmp(digits + CAPTURE_NAME_DIGITS, CAPTURE_FILE_EXT) == 0;
+}
+
+static esp_err_t make_capture_filename(uint32_t index, char *name, size_t name_size)
+{
+    int written = snprintf(name,
+                           name_size,
+                           CAPTURE_NAME_PREFIX "%0*" PRIu32 CAPTURE_FILE_EXT,
+                           CAPTURE_NAME_DIGITS,
+                           index);
+    if (written < 0 || written >= name_size) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    return ESP_OK;
+}
+
+static esp_err_t make_capture_path(const char *name, char *path, size_t path_size)
+{
+    if (!is_capture_filename(name)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    int written = snprintf(path, path_size, CAPTURE_DIR "/%s", name);
+    if (written < 0 || written >= path_size) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    return ESP_OK;
+}
+
+static void init_next_capture_index(void)
+{
+    uint32_t max_index = 0;
+    DIR *dir = opendir(CAPTURE_DIR);
+    if (dir == NULL) {
+        s_next_capture_index = 1;
+        return;
+    }
+
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (!is_capture_filename(entry->d_name)) {
+            continue;
+        }
+
+        uint32_t index = 0;
+        if (sscanf(entry->d_name, CAPTURE_NAME_PREFIX "%" SCNu32 CAPTURE_FILE_EXT, &index) == 1) {
+            max_index = MAX(max_index, index);
+        }
+    }
+
+    closedir(dir);
+    s_next_capture_index = max_index + 1;
+}
+
+static esp_err_t app_capture_storage_init(void)
+{
+    esp_vfs_fat_sdmmc_mount_config_t mount_config = {
+        .format_if_mount_failed = false,
+        .max_files = 8,
+        .allocation_unit_size = 16 * 1024,
+    };
+    sdmmc_host_t host = SDMMC_HOST_DEFAULT();
+    sdmmc_slot_config_t slot_config = SDMMC_SLOT_CONFIG_DEFAULT();
+
+    host.slot = SDMMC_HOST_SLOT_0;
+    slot_config.width = 4;
+    slot_config.flags |= SDMMC_SLOT_FLAG_INTERNAL_PULLUP;
+
+    ESP_LOGI(TAG, "Mounting SD card at %s", CAPTURE_MOUNT_POINT);
+    esp_err_t ret = esp_vfs_fat_sdmmc_mount(CAPTURE_MOUNT_POINT, &host, &slot_config, &mount_config, &s_sd_card);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "SD card mount failed: %s", esp_err_to_name(ret));
+        s_capture_storage_mounted = false;
+        return ret;
+    }
+
+    if (mkdir(CAPTURE_DIR, 0775) != 0 && errno != EEXIST) {
+        ESP_LOGW(TAG, "Failed to create capture dir %s: errno=%d", CAPTURE_DIR, errno);
+        esp_vfs_fat_sdcard_unmount(CAPTURE_MOUNT_POINT, s_sd_card);
+        s_sd_card = NULL;
+        s_capture_storage_mounted = false;
+        return ESP_FAIL;
+    }
+
+    init_next_capture_index();
+    s_capture_storage_mounted = true;
+    ESP_LOGI(TAG, "SD capture storage ready, next image index=%" PRIu32, s_next_capture_index);
+    sdmmc_card_print_info(stdout, s_sd_card);
+    return ESP_OK;
+}
+
+static esp_err_t app_wifi_softap_start(void)
+{
+    esp_netif_create_default_wifi_ap();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
+
+    wifi_config_t wifi_config = {
+        .ap = {
+            .ssid = DATA_AP_SSID,
+            .ssid_len = strlen(DATA_AP_SSID),
+            .channel = DATA_AP_CHANNEL,
+            .password = DATA_AP_PASSWORD,
+            .max_connection = DATA_AP_MAX_CONN,
+            .authmode = WIFI_AUTH_WPA2_PSK,
+            .pmf_cfg = {
+                .required = false,
+            },
+        },
+    };
+
+    if (strlen(DATA_AP_PASSWORD) == 0) {
+        wifi_config.ap.authmode = WIFI_AUTH_OPEN;
+    }
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    ESP_LOGI(TAG, "SoftAP started: ssid=%s password=%s url=http://192.168.4.1/captures",
+             DATA_AP_SSID,
+             DATA_AP_PASSWORD);
+    return ESP_OK;
+}
+
+static void app_capture_button_init(web_cam_t *web_cam)
+{
+    (void)web_cam;
+    /* TODO: Select a button GPIO, configure interrupt/debounce, and call
+     * app_capture_save_photo(web_cam, NULL, 0) from a task context.
+     */
 }
 
 #if CONFIG_EXAMPLE_ENABLE_MIPI_CSI_CAM_SENSOR
@@ -262,6 +451,10 @@ static esp_err_t record_bin_handler(httpd_req_t *req)
     httpd_resp_set_hdr(req, "Content-Disposition", "inline; filename=record.bin"); // default name is record.bin
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
 
+    if (xSemaphoreTake(wc->lock, pdMS_TO_TICKS(10000)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+
     memset(&buf, 0, sizeof(buf));
     buf.type   = type;
     buf.memory = MEMORY_TYPE;
@@ -273,12 +466,14 @@ static esp_err_t record_bin_handler(httpd_req_t *req)
         }
     } else {
         ESP_LOGE(TAG, "failed to receive video frame");
+        xSemaphoreGive(wc->lock);
         return ESP_FAIL;
     }
 
     if (ioctl(wc->fd, VIDIOC_QBUF, &buf) != 0) {
         ESP_LOGE(TAG, "failed to free video frame");
     }
+    xSemaphoreGive(wc->lock);
 
     /* Respond with an empty chunk to signal HTTP response completion */
     httpd_resp_send_chunk(req, NULL, 0);
@@ -298,6 +493,10 @@ static esp_err_t pic_handler(httpd_req_t *req)
     httpd_resp_set_type(req, "image/jpeg");
     httpd_resp_set_hdr(req, "Content-Disposition", "inline; filename=capture.jpg");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+
+    if (xSemaphoreTake(wc->lock, pdMS_TO_TICKS(10000)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
 
     memset(&buf, 0, sizeof(buf));
     buf.type   = s_queue_buf_type;
@@ -330,11 +529,13 @@ static esp_err_t pic_handler(httpd_req_t *req)
         if (ioctl(wc->fd, VIDIOC_QBUF, &buf) != 0) {
             ESP_LOGE(TAG, "failed to free video frame");
         }
+        xSemaphoreGive(wc->lock);
 
         /* Respond with an empty chunk to signal HTTP response completion */
         httpd_resp_send_chunk(req, NULL, 0);
     } else {
         ESP_LOGE(TAG, "failed to receive video frame");
+        xSemaphoreGive(wc->lock);
     }
 
     return res;
@@ -373,6 +574,247 @@ static esp_err_t encode_frame_to_jpeg(web_cam_t *wc,
     return ESP_OK;
 }
 
+static esp_err_t capture_jpeg_frame(web_cam_t *wc,
+                                    uint8_t jpeg_quality,
+                                    jpeg_frame_consumer_t consumer,
+                                    void *consumer_ctx)
+{
+    esp_err_t ret = ESP_FAIL;
+    struct v4l2_buffer buf;
+    uint8_t *jpeg_ptr = NULL;
+    size_t jpeg_len = 0;
+
+    if (xSemaphoreTake(wc->lock, pdMS_TO_TICKS(10000)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    memset(&buf, 0, sizeof(buf));
+    buf.type = s_queue_buf_type;
+    buf.memory = MEMORY_TYPE;
+    if (ioctl(wc->fd, VIDIOC_DQBUF, &buf) != 0) {
+        ESP_LOGE(TAG, "failed to receive video frame");
+        xSemaphoreGive(wc->lock);
+        return ESP_FAIL;
+    }
+
+    ret = encode_frame_to_jpeg(wc, wc->buffer[buf.index], buf.bytesused, jpeg_quality, &jpeg_ptr, &jpeg_len);
+    if (ret == ESP_OK) {
+        ret = consumer(jpeg_ptr, jpeg_len, consumer_ctx);
+    } else {
+        ESP_LOGE(TAG, "jpeg encode failed: %s", esp_err_to_name(ret));
+    }
+
+    if (ioctl(wc->fd, VIDIOC_QBUF, &buf) != 0) {
+        ESP_LOGE(TAG, "failed to free video frame");
+        if (ret == ESP_OK) {
+            ret = ESP_FAIL;
+        }
+    }
+
+    xSemaphoreGive(wc->lock);
+    return ret;
+}
+
+typedef struct {
+    const char *path;
+} file_write_ctx_t;
+
+static esp_err_t write_jpeg_file_consumer(const uint8_t *jpeg, size_t jpeg_len, void *ctx)
+{
+    file_write_ctx_t *write_ctx = (file_write_ctx_t *)ctx;
+    FILE *file = fopen(write_ctx->path, "wb");
+    if (file == NULL) {
+        ESP_LOGE(TAG, "Failed to open %s for write: errno=%d", write_ctx->path, errno);
+        return ESP_FAIL;
+    }
+
+    size_t written = fwrite(jpeg, 1, jpeg_len, file);
+    int close_ret = fclose(file);
+    if (written != jpeg_len || close_ret != 0) {
+        ESP_LOGE(TAG, "Failed to write %s: written=%u/%u close=%d errno=%d",
+                 write_ctx->path,
+                 (unsigned int)written,
+                 (unsigned int)jpeg_len,
+                 close_ret,
+                 errno);
+        return ESP_FAIL;
+    }
+
+    return ESP_OK;
+}
+
+static esp_err_t app_capture_save_photo(web_cam_t *wc, char *saved_name, size_t saved_name_size)
+{
+    if (!s_capture_storage_mounted) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    char name[CAPTURE_FILENAME_MAX_LEN];
+    char path[CAPTURE_PATH_MAX_LEN];
+
+    if (xSemaphoreTake(s_capture_index_lock, pdMS_TO_TICKS(5000)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    uint32_t index = s_next_capture_index++;
+    xSemaphoreGive(s_capture_index_lock);
+
+    esp_err_t ret = make_capture_filename(index, name, sizeof(name));
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    ret = make_capture_path(name, path, sizeof(path));
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    file_write_ctx_t write_ctx = {
+        .path = path,
+    };
+    ret = capture_jpeg_frame(wc, JPEG_ENC_QUALITY, write_jpeg_file_consumer, &write_ctx);
+    if (ret != ESP_OK) {
+        unlink(path);
+        return ret;
+    }
+
+    if (saved_name != NULL && saved_name_size > 0) {
+        snprintf(saved_name, saved_name_size, "%s", name);
+    }
+
+    ESP_LOGI(TAG, "Saved capture: %s", path);
+    return ESP_OK;
+}
+
+static esp_err_t capture_handler(httpd_req_t *req)
+{
+    char saved_name[CAPTURE_FILENAME_MAX_LEN] = {0};
+    web_cam_t *wc = (web_cam_t *)req->user_ctx;
+
+    esp_err_t ret = app_capture_save_photo(wc, saved_name, sizeof(saved_name));
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "capture save failed: %s", esp_err_to_name(ret));
+        httpd_resp_send_err(req,
+                            HTTPD_500_INTERNAL_SERVER_ERROR,
+                            s_capture_storage_mounted ? "capture failed" : "sd card not mounted");
+        return ret;
+    }
+
+    httpd_resp_set_status(req, "303 See Other");
+    httpd_resp_set_hdr(req, "Location", "/captures");
+    httpd_resp_set_type(req, "text/plain");
+    return httpd_resp_send(req, saved_name, HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t captures_handler(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "text/html; charset=utf-8");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+
+    httpd_resp_sendstr_chunk(req,
+                             "<!doctype html><html><head><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+                             "<title>ESP32-P4 Captures</title>"
+                             "<style>"
+                             "body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:20px;background:#f7f7f5;color:#1c1c1c}"
+                             "header{display:flex;gap:12px;align-items:center;justify-content:space-between;flex-wrap:wrap}"
+                             "a.button{background:#0b6bcb;color:white;padding:10px 14px;border-radius:6px;text-decoration:none}"
+                             ".grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:12px;margin-top:18px}"
+                             ".item{background:white;border:1px solid #ddd;border-radius:6px;padding:8px}"
+                             "img{width:100%;height:auto;display:block;border-radius:4px}.name{font-size:13px;margin-top:6px;word-break:break-all}"
+                             "</style></head><body><header><h1>Captures</h1><a class=\"button\" href=\"/capture\">Capture</a></header>");
+
+    if (!s_capture_storage_mounted) {
+        httpd_resp_sendstr_chunk(req, "<p>SD card is not mounted.</p></body></html>");
+        return httpd_resp_sendstr_chunk(req, NULL);
+    }
+
+    DIR *dir = opendir(CAPTURE_DIR);
+    if (dir == NULL) {
+        httpd_resp_sendstr_chunk(req, "<p>Failed to open capture directory.</p></body></html>");
+        return httpd_resp_sendstr_chunk(req, NULL);
+    }
+
+    httpd_resp_sendstr_chunk(req, "<div class=\"grid\">");
+    int count = 0;
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (!is_capture_filename(entry->d_name)) {
+            continue;
+        }
+
+        char name[CAPTURE_FILENAME_MAX_LEN];
+        memcpy(name, entry->d_name, sizeof(name) - 1);
+        name[sizeof(name) - 1] = '\0';
+        char item[256];
+        snprintf(item,
+                 sizeof(item),
+                 "<a class=\"item\" href=\"/photo?name=%s\"><img src=\"/photo?name=%s\" loading=\"lazy\"><div class=\"name\">%s</div></a>",
+                 name,
+                 name,
+                 name);
+        httpd_resp_sendstr_chunk(req, item);
+        count++;
+    }
+    closedir(dir);
+
+    if (count == 0) {
+        httpd_resp_sendstr_chunk(req, "</div><p>No captures yet.</p>");
+    } else {
+        httpd_resp_sendstr_chunk(req, "</div>");
+    }
+
+    httpd_resp_sendstr_chunk(req, "</body></html>");
+    return httpd_resp_sendstr_chunk(req, NULL);
+}
+
+static esp_err_t photo_handler(httpd_req_t *req)
+{
+    if (!s_capture_storage_mounted) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "sd card not mounted");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    char query[64] = {0};
+    char name[CAPTURE_FILENAME_MAX_LEN] = {0};
+    char path[CAPTURE_PATH_MAX_LEN] = {0};
+
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK ||
+        httpd_query_key_value(query, "name", name, sizeof(name)) != ESP_OK ||
+        make_capture_path(name, path, sizeof(path)) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid photo name");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    FILE *file = fopen(path, "rb");
+    if (file == NULL) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "photo not found");
+        return ESP_FAIL;
+    }
+
+    httpd_resp_set_type(req, "image/jpeg");
+    httpd_resp_set_hdr(req, "Content-Disposition", "inline");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+
+    char chunk[1024];
+    esp_err_t ret = ESP_OK;
+    while (!feof(file)) {
+        size_t read_len = fread(chunk, 1, sizeof(chunk), file);
+        if (read_len > 0) {
+            ret = httpd_resp_send_chunk(req, chunk, read_len);
+            if (ret != ESP_OK) {
+                break;
+            }
+        }
+    }
+
+    fclose(file);
+    if (ret == ESP_OK) {
+        ret = httpd_resp_send_chunk(req, NULL, 0);
+    }
+
+    return ret;
+}
+
 static esp_err_t classify_handler(httpd_req_t *req)
 {
     esp_err_t res = ESP_FAIL;
@@ -393,12 +835,18 @@ static esp_err_t classify_handler(httpd_req_t *req)
     httpd_resp_set_hdr(req, "Content-Disposition", "inline; filename=classify.jpg");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
 
+    if (xSemaphoreTake(wc->lock, pdMS_TO_TICKS(10000)) != pdTRUE) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "camera busy");
+        return ESP_ERR_TIMEOUT;
+    }
+
     memset(&buf, 0, sizeof(buf));
     buf.type = s_queue_buf_type;
     buf.memory = MEMORY_TYPE;
     res = ioctl(wc->fd, VIDIOC_DQBUF, &buf);
     if (res != 0) {
         ESP_LOGE(TAG, "failed to receive video frame");
+        xSemaphoreGive(wc->lock);
         return ESP_FAIL;
     }
 
@@ -411,6 +859,7 @@ static esp_err_t classify_handler(httpd_req_t *req)
     if (ioctl(wc->fd, VIDIOC_QBUF, &buf) != 0) {
         ESP_LOGE(TAG, "failed to free video frame");
     }
+    xSemaphoreGive(wc->lock);
 
     if (res != ESP_OK) {
         ESP_LOGE(TAG, "classification failed (%s)", esp_err_to_name(res));
@@ -476,11 +925,17 @@ static esp_err_t new_web_cam(int cam_fd, web_cam_t **ret_wc)
     if (!wc) {
         return ESP_ERR_NO_MEM;
     }
+    memset(wc, 0, sizeof(*wc));
 
     wc->fd = cam_fd;
     wc->width = format.fmt.pix.width;
     wc->height = format.fmt.pix.height;
     wc->pixel_format = format.fmt.pix.pixelformat;
+    wc->lock = xSemaphoreCreateMutex();
+    if (wc->lock == NULL) {
+        free(wc);
+        return ESP_ERR_NO_MEM;
+    }
 
     jpeg_enc_input_format_t jpeg_enc_infmt = get_jpeg_enc_input_fmt(format.fmt.pix.pixelformat);
 
@@ -568,6 +1023,9 @@ static esp_err_t new_web_cam(int cam_fd, web_cam_t **ret_wc)
     return ESP_OK;
 
 errout:
+    if (wc->lock != NULL) {
+        vSemaphoreDelete(wc->lock);
+    }
     free(wc);
     return ret;
 }
@@ -599,6 +1057,24 @@ static esp_err_t http_server_init(int index, web_cam_t *web_cam)
         .handler = classify_handler,
         .user_ctx = (void *)web_cam
     };
+    httpd_uri_t capture_get_uri = {
+        .uri = "/capture",
+        .method = HTTP_GET,
+        .handler = capture_handler,
+        .user_ctx = (void *)web_cam,
+    };
+    httpd_uri_t captures_get_uri = {
+        .uri = "/captures",
+        .method = HTTP_GET,
+        .handler = captures_handler,
+        .user_ctx = NULL,
+    };
+    httpd_uri_t photo_get_uri = {
+        .uri = "/photo",
+        .method = HTTP_GET,
+        .handler = photo_handler,
+        .user_ctx = NULL,
+    };
 
     ret = httpd_start(&video_web_httpd, &config);
     if (ret != ESP_OK) {
@@ -609,8 +1085,13 @@ static esp_err_t http_server_init(int index, web_cam_t *web_cam)
     ESP_ERROR_CHECK(httpd_register_uri_handler(video_web_httpd, &pic_get_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(video_web_httpd, &record_file_get_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(video_web_httpd, &classify_get_uri));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(video_web_httpd, &capture_get_uri));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(video_web_httpd, &captures_get_uri));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(video_web_httpd, &photo_get_uri));
 
-    ESP_LOGI(TAG, "Starting HTTP server on port: '%d' (/pic, /record, /classify.jpg)", config.server_port);
+    ESP_LOGI(TAG,
+             "Starting HTTP server on port: '%d' (/pic, /record, /classify.jpg, /capture, /captures, /photo)",
+             config.server_port);
 
     return ESP_OK;
 }
@@ -633,6 +1114,7 @@ static esp_err_t start_cam_web_server(int index, int cam_fd)
         ESP_LOGE(TAG, "Failed to new web cam");
         return ret;
     }
+    app_capture_button_init(web_cam);
     return http_server_init(index, web_cam);
 }
 
@@ -664,6 +1146,12 @@ void app_main(void)
 
     app_tune_task_wdt();
 
+    s_capture_index_lock = xSemaphoreCreateMutex();
+    if (s_capture_index_lock == NULL) {
+        ESP_LOGE(TAG, "failed to create capture index lock");
+        return;
+    }
+
     /* Initialize the camera before network setup so sensors that depend on
      * early clock/power sequencing are detected right after boot.
      */
@@ -676,11 +1164,12 @@ void app_main(void)
     netbiosns_init();
     netbiosns_set_name(EXAMPLE_MDNS_HOST_NAME);
 
-    /* This helper function configures Wi-Fi or Ethernet, as selected in menuconfig.
-     * Read "Establishing Wi-Fi or Ethernet Connection" section in
-     * examples/protocols/README.md for more information about this function.
-     */
-    ESP_ERROR_CHECK(example_connect());
+    ESP_ERROR_CHECK(app_wifi_softap_start());
+
+    ret = app_capture_storage_init();
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Capture storage disabled until SD card mount succeeds");
+    }
 
     int video_cam_fd = app_video_open(CAM_DEV_PATH, EXAMPLE_VIDEO_FMT_RGB565);
     if (video_cam_fd < 0) {
