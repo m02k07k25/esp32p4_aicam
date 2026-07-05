@@ -12,7 +12,6 @@
 
 #if CONFIG_ESP_HOSTED_ENABLE_PEER_DATA_TRANSFER
 #include "esp_hosted.h"
-#endif
 
 static const char *TAG = "sdio_frame_tx";
 
@@ -25,6 +24,7 @@ static void copy_class_name(char dest[SDIO_FRAME_CLASS_NAME_MAX], const char *sr
 
     snprintf(dest, SDIO_FRAME_CLASS_NAME_MAX, "%s", src);
 }
+#endif
 
 esp_err_t sdio_frame_tx_send_classification(const uint8_t *jpeg,
                                             size_t jpeg_len,

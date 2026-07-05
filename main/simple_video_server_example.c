@@ -34,6 +34,7 @@
 #define MEMORY_TYPE                  V4L2_MEMORY_MMAP
 #define CAM_DEV_PATH                 ESP_VIDEO_MIPI_CSI_DEVICE_NAME
 #define JPEG_ENC_QUALITY             (80)
+#define EXAMPLE_MIPI_SCCB_RETRY_DELAY_MS 1000
 #ifndef ARRAY_SIZE
 #define ARRAY_SIZE(arr) (sizeof(arr) / sizeof(arr[0]))
 #endif
@@ -144,6 +145,22 @@ static const esp_video_init_config_t cam_config = {
     .dvp      = dvp_config,
 #endif
 };
+
+static void app_wait_for_video_init(void)
+{
+    for (int attempt = 1;; attempt++) {
+        ESP_LOGI(TAG, "Initializing camera, attempt %d", attempt);
+        esp_err_t ret = esp_video_init(&cam_config);
+        if (ret == ESP_OK) {
+            ESP_LOGI(TAG, "Camera initialized");
+            return;
+        }
+
+        ESP_LOGW(TAG, "esp_video_init failed: %s; retrying in %d ms",
+                 esp_err_to_name(ret), EXAMPLE_MIPI_SCCB_RETRY_DELAY_MS);
+        vTaskDelay(pdMS_TO_TICKS(EXAMPLE_MIPI_SCCB_RETRY_DELAY_MS));
+    }
+}
 
 /**
  * @brief   Open the video device and initialize the video device to use `init_fmt` as the output format.
@@ -645,9 +662,15 @@ void app_main(void)
         ESP_ERROR_CHECK(nvs_flash_init());
     }
 
+    app_tune_task_wdt();
+
+    /* Initialize the camera before network setup so sensors that depend on
+     * early clock/power sequencing are detected right after boot.
+     */
+    app_wait_for_video_init();
+
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
-    app_tune_task_wdt();
 
     initialise_mdns();
     netbiosns_init();
@@ -658,8 +681,6 @@ void app_main(void)
      * examples/protocols/README.md for more information about this function.
      */
     ESP_ERROR_CHECK(example_connect());
-
-    ESP_ERROR_CHECK(esp_video_init(&cam_config));
 
     int video_cam_fd = app_video_open(CAM_DEV_PATH, EXAMPLE_VIDEO_FMT_RGB565);
     if (video_cam_fd < 0) {
