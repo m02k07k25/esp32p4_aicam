@@ -17,6 +17,7 @@
 #include <unistd.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "freertos/task.h"
 #include "esp_event.h"
 #include "esp_err.h"
 #include "esp_log.h"
@@ -29,10 +30,14 @@
 #include "sdkconfig.h"
 #include "sdmmc_cmd.h"
 #include "driver/sdmmc_host.h"
+#if CONFIG_EXAMPLE_CAPTURE_SD_PWR_CTRL_LDO_INTERNAL_IO
+#include "sd_pwr_ctrl_by_on_chip_ldo.h"
+#endif
 #include "linux/videodev2.h"
 #include "esp_video_init.h"
 #include "esp_video_device.h"
 #include "esp_task_wdt.h"
+#include "driver/gpio.h"
 #include "driver/jpeg_encode.h"
 #include "mdns.h"
 #include "lwip/apps/netbiosns.h"
@@ -57,11 +62,15 @@
 #define DATA_AP_MAX_CONN 4
 #define CAPTURE_MOUNT_POINT "/sdcard"
 #define CAPTURE_DIR CAPTURE_MOUNT_POINT "/captures"
-#define CAPTURE_NAME_PREFIX "IMG_"
-#define CAPTURE_NAME_DIGITS 6
-#define CAPTURE_FILE_EXT ".jpg"
+#define CAPTURE_NAME_PREFIX "IMG"
+#define CAPTURE_NAME_DIGITS 5
+#define CAPTURE_FILE_EXT ".JPG"
 #define CAPTURE_FILENAME_MAX_LEN 16
 #define CAPTURE_PATH_MAX_LEN 64
+#define CAPTURE_TRIGGER_GPIO GPIO_NUM_1
+#define CAPTURE_TRIGGER_DEBOUNCE_MS 300
+#define CAPTURE_TRIGGER_TASK_STACK_SIZE 6144
+#define CAPTURE_TRIGGER_TASK_PRIORITY 5
 
 /*
  * Web cam control structure
@@ -98,8 +107,14 @@ static sdmmc_card_t *s_sd_card;
 static bool s_capture_storage_mounted;
 static uint32_t s_next_capture_index = 1;
 static SemaphoreHandle_t s_capture_index_lock;
+static TaskHandle_t s_capture_button_task_handle;
+#if CONFIG_EXAMPLE_CAPTURE_SD_PWR_CTRL_LDO_INTERNAL_IO
+static sd_pwr_ctrl_handle_t s_sd_pwr_ctrl_handle;
+#endif
 
 typedef esp_err_t (*jpeg_frame_consumer_t)(const uint8_t *jpeg, size_t jpeg_len, void *ctx);
+
+static esp_err_t app_capture_save_photo(web_cam_t *wc, char *saved_name, size_t saved_name_size);
 
 static void app_tune_task_wdt(void)
 {
@@ -206,15 +221,56 @@ static esp_err_t app_capture_storage_init(void)
     };
     sdmmc_host_t host = SDMMC_HOST_DEFAULT();
     sdmmc_slot_config_t slot_config = SDMMC_SLOT_CONFIG_DEFAULT();
+    esp_err_t ret;
 
-    host.slot = SDMMC_HOST_SLOT_0;
+    host.slot = CONFIG_EXAMPLE_CAPTURE_SDMMC_SLOT;
+#if CONFIG_EXAMPLE_CAPTURE_SD_PWR_CTRL_LDO_INTERNAL_IO
+    sd_pwr_ctrl_ldo_config_t ldo_config = {
+        .ldo_chan_id = CONFIG_EXAMPLE_CAPTURE_SD_PWR_CTRL_LDO_IO_ID,
+    };
+
+    ret = sd_pwr_ctrl_new_on_chip_ldo(&ldo_config, &s_sd_pwr_ctrl_handle);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "SD power LDO init failed: %s", esp_err_to_name(ret));
+        s_capture_storage_mounted = false;
+        return ret;
+    }
+    host.pwr_ctrl_handle = s_sd_pwr_ctrl_handle;
+#endif
+#if CONFIG_EXAMPLE_CAPTURE_SDMMC_BUS_WIDTH_4
     slot_config.width = 4;
+#else
+    slot_config.width = 1;
+#endif
+    slot_config.clk = CONFIG_EXAMPLE_CAPTURE_SDMMC_CLK_PIN;
+    slot_config.cmd = CONFIG_EXAMPLE_CAPTURE_SDMMC_CMD_PIN;
+    slot_config.d0 = CONFIG_EXAMPLE_CAPTURE_SDMMC_D0_PIN;
+#if CONFIG_EXAMPLE_CAPTURE_SDMMC_BUS_WIDTH_4
+    slot_config.d1 = CONFIG_EXAMPLE_CAPTURE_SDMMC_D1_PIN;
+    slot_config.d2 = CONFIG_EXAMPLE_CAPTURE_SDMMC_D2_PIN;
+    slot_config.d3 = CONFIG_EXAMPLE_CAPTURE_SDMMC_D3_PIN;
+#endif
     slot_config.flags |= SDMMC_SLOT_FLAG_INTERNAL_PULLUP;
 
-    ESP_LOGI(TAG, "Mounting SD card at %s", CAPTURE_MOUNT_POINT);
-    esp_err_t ret = esp_vfs_fat_sdmmc_mount(CAPTURE_MOUNT_POINT, &host, &slot_config, &mount_config, &s_sd_card);
+    ESP_LOGI(TAG, "Mounting SD card at %s using SDMMC slot %d width %d GPIOs: CLK[%d] CMD[%d] D0[%d]",
+             CAPTURE_MOUNT_POINT,
+             host.slot,
+             slot_config.width,
+             slot_config.clk,
+             slot_config.cmd,
+             slot_config.d0);
+    ret = esp_vfs_fat_sdmmc_mount(CAPTURE_MOUNT_POINT, &host, &slot_config, &mount_config, &s_sd_card);
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "SD card mount failed: %s", esp_err_to_name(ret));
+#if CONFIG_EXAMPLE_CAPTURE_SD_PWR_CTRL_LDO_INTERNAL_IO
+        if (s_sd_pwr_ctrl_handle != NULL) {
+            esp_err_t pwr_ret = sd_pwr_ctrl_del_on_chip_ldo(s_sd_pwr_ctrl_handle);
+            if (pwr_ret != ESP_OK) {
+                ESP_LOGW(TAG, "SD power LDO cleanup failed: %s", esp_err_to_name(pwr_ret));
+            }
+            s_sd_pwr_ctrl_handle = NULL;
+        }
+#endif
         s_capture_storage_mounted = false;
         return ret;
     }
@@ -222,6 +278,15 @@ static esp_err_t app_capture_storage_init(void)
     if (mkdir(CAPTURE_DIR, 0775) != 0 && errno != EEXIST) {
         ESP_LOGW(TAG, "Failed to create capture dir %s: errno=%d", CAPTURE_DIR, errno);
         esp_vfs_fat_sdcard_unmount(CAPTURE_MOUNT_POINT, s_sd_card);
+#if CONFIG_EXAMPLE_CAPTURE_SD_PWR_CTRL_LDO_INTERNAL_IO
+        if (s_sd_pwr_ctrl_handle != NULL) {
+            esp_err_t pwr_ret = sd_pwr_ctrl_del_on_chip_ldo(s_sd_pwr_ctrl_handle);
+            if (pwr_ret != ESP_OK) {
+                ESP_LOGW(TAG, "SD power LDO cleanup failed: %s", esp_err_to_name(pwr_ret));
+            }
+            s_sd_pwr_ctrl_handle = NULL;
+        }
+#endif
         s_sd_card = NULL;
         s_capture_storage_mounted = false;
         return ESP_FAIL;
@@ -270,12 +335,93 @@ static esp_err_t app_wifi_softap_start(void)
     return ESP_OK;
 }
 
+static void IRAM_ATTR app_capture_button_isr_handler(void *arg)
+{
+    (void)arg;
+
+    BaseType_t high_task_woken = pdFALSE;
+    if (s_capture_button_task_handle != NULL) {
+        vTaskNotifyGiveFromISR(s_capture_button_task_handle, &high_task_woken);
+        if (high_task_woken == pdTRUE) {
+            portYIELD_FROM_ISR();
+        }
+    }
+}
+
+static void app_capture_button_task(void *arg)
+{
+    web_cam_t *web_cam = (web_cam_t *)arg;
+    int64_t last_capture_us = 0;
+
+    for (;;) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+        int64_t now_us = esp_timer_get_time();
+        if (now_us - last_capture_us < CAPTURE_TRIGGER_DEBOUNCE_MS * 1000LL) {
+            continue;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(30));
+        if (gpio_get_level(CAPTURE_TRIGGER_GPIO) != 0) {
+            continue;
+        }
+
+        last_capture_us = esp_timer_get_time();
+        esp_err_t ret = app_capture_save_photo(web_cam, NULL, 0);
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "GPIO capture failed: %s", esp_err_to_name(ret));
+        }
+
+        while (gpio_get_level(CAPTURE_TRIGGER_GPIO) == 0) {
+            vTaskDelay(pdMS_TO_TICKS(20));
+        }
+        ulTaskNotifyTake(pdTRUE, 0);
+    }
+}
+
 static void app_capture_button_init(web_cam_t *web_cam)
 {
-    (void)web_cam;
-    /* TODO: Select a button GPIO, configure interrupt/debounce, and call
-     * app_capture_save_photo(web_cam, NULL, 0) from a task context.
-     */
+    gpio_config_t io_conf = {
+        .pin_bit_mask = 1ULL << CAPTURE_TRIGGER_GPIO,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_NEGEDGE,
+    };
+
+    esp_err_t ret = gpio_config(&io_conf);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "capture trigger GPIO config failed: %s", esp_err_to_name(ret));
+        return;
+    }
+
+    if (s_capture_button_task_handle == NULL) {
+        BaseType_t task_ret = xTaskCreate(app_capture_button_task,
+                                          "capture_button",
+                                          CAPTURE_TRIGGER_TASK_STACK_SIZE,
+                                          web_cam,
+                                          CAPTURE_TRIGGER_TASK_PRIORITY,
+                                          &s_capture_button_task_handle);
+        if (task_ret != pdPASS) {
+            ESP_LOGE(TAG, "failed to create capture button task");
+            return;
+        }
+    }
+
+    ret = gpio_install_isr_service(0);
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "GPIO ISR service install failed: %s", esp_err_to_name(ret));
+        return;
+    }
+
+    ret = gpio_isr_handler_add(CAPTURE_TRIGGER_GPIO, app_capture_button_isr_handler, NULL);
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "capture trigger ISR add failed: %s", esp_err_to_name(ret));
+        return;
+    }
+
+    ESP_LOGI(TAG, "Capture trigger ready: GPIO%d with internal pull-up, active-low to GND",
+             CAPTURE_TRIGGER_GPIO);
 }
 
 #if CONFIG_EXAMPLE_ENABLE_MIPI_CSI_CAM_SENSOR
