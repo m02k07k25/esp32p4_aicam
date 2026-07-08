@@ -187,6 +187,54 @@ static esp_err_t make_capture_path(const char *name, char *path, size_t path_siz
     return ESP_OK;
 }
 
+#if CONFIG_EXAMPLE_CAPTURE_SD_PWR_CTRL_LDO_INTERNAL_IO
+static void app_capture_sd_power_cleanup(void)
+{
+    if (s_sd_pwr_ctrl_handle == NULL) {
+        return;
+    }
+
+    esp_err_t ret = sd_pwr_ctrl_del_on_chip_ldo(s_sd_pwr_ctrl_handle);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "SD power LDO cleanup failed: %s", esp_err_to_name(ret));
+    }
+    s_sd_pwr_ctrl_handle = NULL;
+}
+#endif
+
+#if CONFIG_EXAMPLE_CAPTURE_SD_CARD_POWER_RESET
+static esp_err_t app_capture_sd_card_power_reset(void)
+{
+    gpio_config_t io_conf = {
+        .pin_bit_mask = 1ULL << CONFIG_EXAMPLE_CAPTURE_SD_CARD_POWER_RESET_PIN,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+
+    esp_err_t ret = gpio_config(&io_conf);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    ESP_LOGI(TAG, "Resetting SD card power using GPIO%d", CONFIG_EXAMPLE_CAPTURE_SD_CARD_POWER_RESET_PIN);
+    ret = gpio_set_level(CONFIG_EXAMPLE_CAPTURE_SD_CARD_POWER_RESET_PIN, 1);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    ret = gpio_set_level(CONFIG_EXAMPLE_CAPTURE_SD_CARD_POWER_RESET_PIN, 0);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    return ESP_OK;
+}
+#endif
+
 static void init_next_capture_index(void)
 {
     uint32_t max_index = 0;
@@ -237,6 +285,17 @@ static esp_err_t app_capture_storage_init(void)
     }
     host.pwr_ctrl_handle = s_sd_pwr_ctrl_handle;
 #endif
+#if CONFIG_EXAMPLE_CAPTURE_SD_CARD_POWER_RESET
+    ret = app_capture_sd_card_power_reset();
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "SD card power reset failed: %s", esp_err_to_name(ret));
+#if CONFIG_EXAMPLE_CAPTURE_SD_PWR_CTRL_LDO_INTERNAL_IO
+        app_capture_sd_power_cleanup();
+#endif
+        s_capture_storage_mounted = false;
+        return ret;
+    }
+#endif
 #if CONFIG_EXAMPLE_CAPTURE_SDMMC_BUS_WIDTH_4
     slot_config.width = 4;
 #else
@@ -263,13 +322,7 @@ static esp_err_t app_capture_storage_init(void)
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "SD card mount failed: %s", esp_err_to_name(ret));
 #if CONFIG_EXAMPLE_CAPTURE_SD_PWR_CTRL_LDO_INTERNAL_IO
-        if (s_sd_pwr_ctrl_handle != NULL) {
-            esp_err_t pwr_ret = sd_pwr_ctrl_del_on_chip_ldo(s_sd_pwr_ctrl_handle);
-            if (pwr_ret != ESP_OK) {
-                ESP_LOGW(TAG, "SD power LDO cleanup failed: %s", esp_err_to_name(pwr_ret));
-            }
-            s_sd_pwr_ctrl_handle = NULL;
-        }
+        app_capture_sd_power_cleanup();
 #endif
         s_capture_storage_mounted = false;
         return ret;
@@ -279,13 +332,7 @@ static esp_err_t app_capture_storage_init(void)
         ESP_LOGW(TAG, "Failed to create capture dir %s: errno=%d", CAPTURE_DIR, errno);
         esp_vfs_fat_sdcard_unmount(CAPTURE_MOUNT_POINT, s_sd_card);
 #if CONFIG_EXAMPLE_CAPTURE_SD_PWR_CTRL_LDO_INTERNAL_IO
-        if (s_sd_pwr_ctrl_handle != NULL) {
-            esp_err_t pwr_ret = sd_pwr_ctrl_del_on_chip_ldo(s_sd_pwr_ctrl_handle);
-            if (pwr_ret != ESP_OK) {
-                ESP_LOGW(TAG, "SD power LDO cleanup failed: %s", esp_err_to_name(pwr_ret));
-            }
-            s_sd_pwr_ctrl_handle = NULL;
-        }
+        app_capture_sd_power_cleanup();
 #endif
         s_sd_card = NULL;
         s_capture_storage_mounted = false;
@@ -765,6 +812,42 @@ typedef struct {
     const char *path;
 } file_write_ctx_t;
 
+typedef struct {
+    char name[CAPTURE_FILENAME_MAX_LEN];
+    uint32_t index;
+} capture_list_item_t;
+
+static bool parse_capture_index(const char *name, uint32_t *index)
+{
+    if (!is_capture_filename(name)) {
+        return false;
+    }
+
+    uint32_t parsed_index = 0;
+    if (sscanf(name, CAPTURE_NAME_PREFIX "%" SCNu32 CAPTURE_FILE_EXT, &parsed_index) != 1) {
+        return false;
+    }
+
+    if (index != NULL) {
+        *index = parsed_index;
+    }
+    return true;
+}
+
+static int compare_capture_newest_first(const void *lhs, const void *rhs)
+{
+    const capture_list_item_t *left = (const capture_list_item_t *)lhs;
+    const capture_list_item_t *right = (const capture_list_item_t *)rhs;
+
+    if (left->index < right->index) {
+        return 1;
+    }
+    if (left->index > right->index) {
+        return -1;
+    }
+    return strcmp(right->name, left->name);
+}
+
 static esp_err_t write_jpeg_file_consumer(const uint8_t *jpeg, size_t jpeg_len, void *ctx)
 {
     file_write_ctx_t *write_ctx = (file_write_ctx_t *)ctx;
@@ -880,34 +963,59 @@ static esp_err_t captures_handler(httpd_req_t *req)
         return httpd_resp_sendstr_chunk(req, NULL);
     }
 
-    httpd_resp_sendstr_chunk(req, "<div class=\"grid\">");
-    int count = 0;
+    size_t item_count = 0;
+    size_t item_capacity = 0;
+    capture_list_item_t *items = NULL;
     struct dirent *entry;
     while ((entry = readdir(dir)) != NULL) {
-        if (!is_capture_filename(entry->d_name)) {
+        uint32_t index = 0;
+        if (!parse_capture_index(entry->d_name, &index)) {
             continue;
         }
 
-        char name[CAPTURE_FILENAME_MAX_LEN];
-        memcpy(name, entry->d_name, sizeof(name) - 1);
-        name[sizeof(name) - 1] = '\0';
+        if (item_count == item_capacity) {
+            size_t new_capacity = item_capacity == 0 ? 32 : item_capacity * 2;
+            capture_list_item_t *new_items = realloc(items, new_capacity * sizeof(*new_items));
+            if (new_items == NULL) {
+                free(items);
+                closedir(dir);
+                httpd_resp_sendstr_chunk(req, "<p>Not enough memory to list captures.</p></body></html>");
+                return httpd_resp_sendstr_chunk(req, NULL);
+            }
+            items = new_items;
+            item_capacity = new_capacity;
+        }
+
+        size_t name_len = strlen(entry->d_name);
+        if (name_len >= sizeof(items[item_count].name)) {
+            continue;
+        }
+        memcpy(items[item_count].name, entry->d_name, name_len + 1);
+        items[item_count].index = index;
+        item_count++;
+    }
+    closedir(dir);
+
+    qsort(items, item_count, sizeof(*items), compare_capture_newest_first);
+
+    httpd_resp_sendstr_chunk(req, "<div class=\"grid\">");
+    for (size_t i = 0; i < item_count; i++) {
         char item[256];
         snprintf(item,
                  sizeof(item),
                  "<a class=\"item\" href=\"/photo?name=%s\"><img src=\"/photo?name=%s\" loading=\"lazy\"><div class=\"name\">%s</div></a>",
-                 name,
-                 name,
-                 name);
+                 items[i].name,
+                 items[i].name,
+                 items[i].name);
         httpd_resp_sendstr_chunk(req, item);
-        count++;
     }
-    closedir(dir);
 
-    if (count == 0) {
+    if (item_count == 0) {
         httpd_resp_sendstr_chunk(req, "</div><p>No captures yet.</p>");
     } else {
         httpd_resp_sendstr_chunk(req, "</div>");
     }
+    free(items);
 
     httpd_resp_sendstr_chunk(req, "</body></html>");
     return httpd_resp_sendstr_chunk(req, NULL);

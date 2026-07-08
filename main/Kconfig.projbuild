@@ -204,6 +204,21 @@ menu "Example Configuration"
             help
                 Internal LDO channel used to power the SD card IO rail.
 
+        config EXAMPLE_CAPTURE_SD_CARD_POWER_RESET
+            depends on SOC_SDMMC_IO_POWER_EXTERNAL
+            bool "Reset SD card power before mount"
+            default y if IDF_TARGET_ESP32P4
+            help
+                Toggle the SD card power reset GPIO before probing the card.
+                This helps recover cards left in a bad state after a failed
+                initialization.
+
+        config EXAMPLE_CAPTURE_SD_CARD_POWER_RESET_PIN
+            depends on SOC_SDMMC_IO_POWER_EXTERNAL && EXAMPLE_CAPTURE_SD_CARD_POWER_RESET
+            int "SD card power reset GPIO"
+            default 45 if IDF_TARGET_ESP32P4
+            range 0 56
+
         if EXAMPLE_CAPTURE_SDMMC_BUS_WIDTH_4
 
             config EXAMPLE_CAPTURE_SDMMC_D1_PIN
