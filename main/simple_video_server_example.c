@@ -1159,6 +1159,14 @@ static esp_err_t classify_handler(httpd_req_t *req)
     return httpd_resp_send_chunk(req, NULL, 0);
 }
 
+static esp_err_t root_handler(httpd_req_t *req)
+{
+    httpd_resp_set_status(req, "303 See Other");
+    httpd_resp_set_hdr(req, "Location", "/captures");
+    httpd_resp_set_type(req, "text/plain");
+    return httpd_resp_send(req, "/captures", HTTPD_RESP_USE_STRLEN);
+}
+
 static esp_err_t new_web_cam(int cam_fd, web_cam_t **ret_wc)
 {
     int ret;
@@ -1293,6 +1301,12 @@ static esp_err_t http_server_init(int index, web_cam_t *web_cam)
     config.server_port += index;
     config.ctrl_port += index;
 
+    httpd_uri_t root_get_uri = {
+        .uri = "/",
+        .method = HTTP_GET,
+        .handler = root_handler,
+        .user_ctx = NULL,
+    };
     httpd_uri_t pic_get_uri = {
         .uri = "/pic",
         .method = HTTP_GET,
@@ -1336,6 +1350,7 @@ static esp_err_t http_server_init(int index, web_cam_t *web_cam)
         return ret;
     }
 
+    ESP_ERROR_CHECK(httpd_register_uri_handler(video_web_httpd, &root_get_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(video_web_httpd, &pic_get_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(video_web_httpd, &record_file_get_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(video_web_httpd, &classify_get_uri));
@@ -1344,7 +1359,7 @@ static esp_err_t http_server_init(int index, web_cam_t *web_cam)
     ESP_ERROR_CHECK(httpd_register_uri_handler(video_web_httpd, &photo_get_uri));
 
     ESP_LOGI(TAG,
-             "Starting HTTP server on port: '%d' (/pic, /record, /classify.jpg, /capture, /captures, /photo)",
+             "Starting HTTP server on port: '%d' (/, /pic, /record, /classify.jpg, /capture, /captures, /photo)",
              config.server_port);
 
     return ESP_OK;
@@ -1380,7 +1395,7 @@ static void initialise_mdns(void)
 
     mdns_txt_item_t serviceTxtData[] = {
         {"board", CONFIG_IDF_TARGET},
-        {"path", "/"}
+        {"path", "/captures"}
     };
 
     ESP_ERROR_CHECK(mdns_service_add("ESP32-WebServer", "_http", "_tcp", 80, serviceTxtData,
