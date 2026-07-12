@@ -26,11 +26,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument("--workers", type=int, default=8, help="Concurrent download workers.")
     parser.add_argument(
+        "--max-person-area-ratio",
+        type=person_area_ratio,
+        default=0.30,
+        help="Keep human images whose largest person bbox occupies at most this fraction of the image.",
+    )
+    parser.add_argument(
         "--force-redownload",
         action="store_true",
         help="Redownload images even if they already exist in download/.",
     )
     return parser.parse_args()
+
+
+def person_area_ratio(value: str) -> float:
+    ratio = float(value)
+    if not 0.0 < ratio <= 1.0:
+        raise argparse.ArgumentTypeError("person area ratio must be greater than 0 and at most 1")
+    return ratio
 
 
 def ensure_dir(path: Path) -> None:
@@ -89,20 +102,61 @@ def person_category_id(coco: dict) -> int:
     raise RuntimeError("COCO categories did not contain 'person'.")
 
 
-def sample_image_infos(coco: dict, person_id: int, class_label: str, sample_count: int, rng: random.Random) -> list[dict]:
+def eligible_human_ids(coco: dict, person_id: int, max_person_area_ratio: float) -> tuple[set[int], set[int]]:
     images_by_id = {int(image["id"]): image for image in coco["images"]}
-    human_ids = {int(annotation["image_id"]) for annotation in coco["annotations"] if int(annotation["category_id"]) == person_id}
+    human_ids: set[int] = set()
+    largest_person_ratio: dict[int, float] = {}
+
+    for annotation in coco["annotations"]:
+        if int(annotation["category_id"]) != person_id:
+            continue
+
+        image_id = int(annotation["image_id"])
+        human_ids.add(image_id)
+        bbox = annotation.get("bbox")
+        image = images_by_id.get(image_id)
+        if bbox is None or image is None:
+            continue
+
+        image_area = float(image["width"] * image["height"])
+        if image_area <= 0:
+            continue
+
+        _, _, width, height = bbox
+        ratio = max(0.0, float(width) * float(height)) / image_area
+        largest_person_ratio[image_id] = max(largest_person_ratio.get(image_id, 0.0), ratio)
+
+    filtered_ids = {
+        image_id
+        for image_id, ratio in largest_person_ratio.items()
+        if ratio <= max_person_area_ratio
+    }
+    return human_ids, filtered_ids
+
+
+def sample_image_infos(
+    coco: dict,
+    person_id: int,
+    class_label: str,
+    sample_count: int,
+    rng: random.Random,
+    max_person_area_ratio: float,
+) -> list[dict]:
+    images_by_id = {int(image["id"]): image for image in coco["images"]}
+    human_ids, filtered_human_ids = eligible_human_ids(coco, person_id, max_person_area_ratio)
     all_ids = set(images_by_id.keys())
 
     if class_label == "human":
-        candidate_ids = sorted(human_ids)
+        candidate_ids = sorted(filtered_human_ids)
     elif class_label == "no_human":
         candidate_ids = sorted(all_ids - human_ids)
     else:
         raise ValueError(f"Unsupported class label: {class_label}")
 
     if len(candidate_ids) < sample_count:
-        raise RuntimeError(f"Requested {sample_count} {class_label} images, but COCO only has {len(candidate_ids)}.")
+        raise RuntimeError(
+            f"Requested {sample_count} {class_label} images, but only {len(candidate_ids)} match the filters."
+        )
 
     selected_ids = rng.sample(candidate_ids, sample_count)
     return [images_by_id[image_id] for image_id in selected_ids]
@@ -187,10 +241,26 @@ def main() -> None:
 
     print("Sampling image ids ...")
     train_samples = {
-        label: sample_image_infos(train_coco, person_id, label, args.train_per_class, rng) for label in labels
+        label: sample_image_infos(
+            train_coco,
+            person_id,
+            label,
+            args.train_per_class,
+            rng,
+            args.max_person_area_ratio,
+        )
+        for label in labels
     }
     val_samples = {
-        label: sample_image_infos(val_coco, person_id, label, args.val_per_class, rng) for label in labels
+        label: sample_image_infos(
+            val_coco,
+            person_id,
+            label,
+            args.val_per_class,
+            rng,
+            args.max_person_area_ratio,
+        )
+        for label in labels
     }
 
     print("Downloading selected train images ...")
