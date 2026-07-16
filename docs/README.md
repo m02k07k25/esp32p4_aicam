@@ -103,6 +103,6 @@ X-Inference-Total-Ms: 38.46
 
 ## 참고
 
-- 런타임 전처리는 정사각형 카메라 프레임을 `224x224`로 리사이즈합니다.
+- 런타임 전처리는 `800x800` 프레임의 사분면 4개와 중앙 영역을 각각 `224x224`로 리사이즈해 5회 추론합니다.
 - 펌웨어 정규화 값은 torchvision ImageNet normalization과 맞춰져 있습니다.
 - `model/labels.txt`와 `main/infer_config.h`의 2개 라벨 순서는 항상 같아야 합니다.

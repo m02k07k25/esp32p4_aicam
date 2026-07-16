@@ -46,9 +46,10 @@ OV5647 sensor
   -> 800x800 frame
   -> app requests RGB565 output
   -> /classify.jpg dequeues one frame
-  -> infer_bridge preprocesses 800x800 RGB565 -> 224x224 tensor
-  -> MobileNetV2 0.35-width classifier runs with esp-dl
-  -> top-1 class is returned through HTTP headers
+  -> infer_bridge defines four 400x400 quadrants plus one centered 400x400 crop
+  -> each crop is resized directly to a 224x224 tensor
+  -> MobileNetV2 0.35-width classifier runs five times with esp-dl
+  -> the result from the crop with the highest human score is returned through HTTP headers
   -> JPEG and classification metadata are chunked and sent to C6 over ESP-Hosted custom data
   -> the original frame is JPEG-encoded and returned as classify.jpg
   -> V4L2 buffer is queued back to the driver

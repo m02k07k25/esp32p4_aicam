@@ -25,8 +25,17 @@ const char *g_infer_labels[INFER_LABEL_COUNT] = {
 namespace {
 static const char *TAG = "infer_bridge";
 static const int kInferMutexTimeoutMs = 5000;
-static const int kTopK = 1;
+static const int kTopK = INFER_LABEL_COUNT;
+static const int kCropRegionCount = 5;
+static const int kHumanClassIndex = 1;
 static const float kScoreThreshold = 0.0f;
+static const char *kCropRegionNames[kCropRegionCount] = {
+    "top_left",
+    "top_right",
+    "bottom_left",
+    "bottom_right",
+    "center",
+};
 static const std::vector<float> kImageNetMean = {
     123.675f,
     116.280f,
@@ -77,6 +86,13 @@ public:
     bool ready() const
     {
         return m_model != nullptr && m_image_preprocessor != nullptr && m_postprocessor != nullptr;
+    }
+
+    std::vector<dl::cls::result_t> &run_crop(const dl::image::img_t &img, const std::vector<int> &crop_area)
+    {
+        m_image_preprocessor->preprocess(img, crop_area);
+        m_model->run();
+        return m_postprocessor->postprocess();
     }
 };
 
@@ -169,7 +185,7 @@ extern "C" esp_err_t infer_bridge_process_rgb565(const uint8_t *rgb565_frame,
     if (s_classifier == nullptr || s_infer_lock == nullptr) {
         return ESP_ERR_INVALID_STATE;
     }
-    if (rgb565_frame == nullptr || result == nullptr || width == 0 || height == 0) {
+    if (rgb565_frame == nullptr || result == nullptr || width < 2 || height < 2) {
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -184,24 +200,93 @@ extern "C" esp_err_t infer_bridge_process_rgb565(const uint8_t *rgb565_frame,
         .height = height,
         .pix_type = dl::image::DL_IMAGE_PIX_TYPE_RGB565,
     };
-    int64_t start_us = esp_timer_get_time();
-    std::vector<dl::cls::result_t> &results = s_classifier->run(frame);
-    int64_t end_us = esp_timer_get_time();
 
-    if (results.empty()) {
-        ESP_LOGE(TAG, "classifier returned no results");
-        ret = ESP_FAIL;
-        goto cleanup;
+    const int half_width = width / 2;
+    const int half_height = height / 2;
+    const int center_left = (width - half_width) / 2;
+    const int center_top = (height - half_height) / 2;
+    const int crop_regions[kCropRegionCount][4] = {
+        {0, 0, half_width, half_height},
+        {width - half_width, 0, width, half_height},
+        {0, height - half_height, half_width, height},
+        {width - half_width, height - half_height, width, height},
+        {center_left, center_top, center_left + half_width, center_top + half_height},
+    };
+    std::vector<int> crop_area(4);
+    float best_human_score = -1.0f;
+    const char *best_class_name = nullptr;
+    int best_class_id = -1;
+    float best_class_score = 0.0f;
+    int best_region_index = -1;
+
+    int64_t start_us = esp_timer_get_time();
+    for (int region_index = 0; region_index < kCropRegionCount; ++region_index) {
+        for (int coordinate = 0; coordinate < 4; ++coordinate) {
+            crop_area[coordinate] = crop_regions[region_index][coordinate];
+        }
+
+        std::vector<dl::cls::result_t> &results = s_classifier->run_crop(frame, crop_area);
+        if (results.empty()) {
+            ESP_LOGE(TAG, "classifier returned no results for region %s", kCropRegionNames[region_index]);
+            ret = ESP_FAIL;
+            goto cleanup;
+        }
+
+        int top_class_id = infer_label_to_index(results.front().cat_name);
+        if (top_class_id < 0) {
+            ESP_LOGE(TAG, "classifier returned unknown label for region %s", kCropRegionNames[region_index]);
+            ret = ESP_FAIL;
+            goto cleanup;
+        }
+
+        float human_score = -1.0f;
+        for (const dl::cls::result_t &region_result : results) {
+            if (infer_label_to_index(region_result.cat_name) == kHumanClassIndex) {
+                human_score = region_result.score;
+                break;
+            }
+        }
+        if (human_score < 0.0f) {
+            ESP_LOGE(TAG, "classifier did not return a human score for region %s", kCropRegionNames[region_index]);
+            ret = ESP_FAIL;
+            goto cleanup;
+        }
+
+        ESP_LOGI(TAG,
+                 "region=%s crop=[%d,%d,%d,%d] class=%s score=%.4f human_score=%.4f",
+                 kCropRegionNames[region_index],
+                 crop_area[0],
+                 crop_area[1],
+                 crop_area[2],
+                 crop_area[3],
+                 results.front().cat_name,
+                 results.front().score,
+                 human_score);
+
+        if (human_score > best_human_score) {
+            best_human_score = human_score;
+            best_class_name = results.front().cat_name;
+            best_class_id = top_class_id;
+            best_class_score = results.front().score;
+            best_region_index = region_index;
+        }
     }
 
-    result->class_name = results.front().cat_name;
-    result->class_id = infer_label_to_index(result->class_name);
-    result->score = results.front().score;
-    result->inference_ms = (float)(end_us - start_us) / 1000.0f;
+    result->class_name = best_class_name;
+    result->class_id = best_class_id;
+    result->score = best_class_score;
+    result->inference_ms = (float)(esp_timer_get_time() - start_us) / 1000.0f;
 
-    if (result->class_id < 0) {
-        ESP_LOGE(TAG, "classifier returned unknown label");
+    if (best_region_index < 0) {
+        ESP_LOGE(TAG, "classifier did not select a crop region");
         ret = ESP_FAIL;
+    } else {
+        ESP_LOGI(TAG,
+                 "selected region=%s class=%s score=%.4f human_score=%.4f",
+                 kCropRegionNames[best_region_index],
+                 result->class_name,
+                 result->score,
+                 best_human_score);
     }
 
 cleanup:
