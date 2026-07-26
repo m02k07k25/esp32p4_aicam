@@ -1,0 +1,43 @@
+{
+  "format_version": 2,
+  "architecture": "mobilenet_v2_035_keras_tf_same",
+  "width_mult": "0.35",
+  "image_size": 224,
+  "preprocess_profile": "keras_mobilenet_v2_minus_one_to_one",
+  "input_mean": [
+    0.5,
+    0.5,
+    0.5
+  ],
+  "input_std": [
+    0.5,
+    0.5,
+    0.5
+  ],
+  "labels": [
+    "no_human",
+    "human"
+  ],
+  "inference": {
+    "aggregation": "max_human_score_over_five_half_frame_crops",
+    "human_class": "human",
+    "human_threshold": "0.72482645511627197",
+    "decision_rule": "gte",
+    "threshold_source": "validation_balanced_accuracy"
+  },
+  "source_checkpoint_sha256": "4ca4cb68c1747cc1ffc5bedd55d399c39c4a2787a029a3b309896667a8e093db",
+  "dataset_split_manifest_sha256": "0e8914f2176a84c5749eb5331e0e004960c052ff70cb94c86e5399bca15fbbe5",
+  "quantization": {
+    "target": "esp32p4",
+    "bits": 8,
+    "profile": "mixed_int8_int16",
+    "calibration_algorithm": "kl",
+    "mixed_int16_operations": [
+      "/features/features.1/conv/conv.0/conv.0.0/Conv",
+      "/features/features.1/conv/conv.0/conv.0.2/Clip"
+    ]
+  },
+  "source_onnx": "classifier_224.onnx",
+  "source_onnx_sha256": "0708ae85da93dbb0e7ad13d6ba58f2015c4a15de8167fb52f94996441a8db346",
+  "espdl_sha256": "78be2aaf56f370d712ab728be8f50fed7f960ef324ef95d414207eaa767fd62b"
+}

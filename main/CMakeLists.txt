@@ -16,11 +16,11 @@ set(srcs
     "infer_bridge.cpp")
 
 set(classifier_model "${CMAKE_CURRENT_LIST_DIR}/../model/artifacts/espdl/classifier_224_p4.espdl")
-if (NOT EXISTS "${classifier_model}")
-    message(FATAL_ERROR
-        "Missing classifier model: ${classifier_model}\n"
-        "Generate model/artifacts/espdl/classifier_224_p4.espdl with model/quantize_espdl.py before building.")
-endif()
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+             "${classifier_model}"
+             "${classifier_model}.json")
+include("${CMAKE_CURRENT_LIST_DIR}/classifier_manifest.cmake")
+validate_classifier_model("${classifier_model}")
 
 idf_component_register(SRCS ${srcs}
                        PRIV_INCLUDE_DIRS .
@@ -39,6 +39,9 @@ idf_component_register(SRCS ${srcs}
                                      log
                                      esp_common
                                      esp_hosted)
+
+target_compile_definitions(${COMPONENT_LIB} PRIVATE
+                           CLASSIFIER_FIVE_CROP_HUMAN_THRESHOLD=${CLASSIFIER_FIVE_CROP_HUMAN_THRESHOLD})
 
 target_add_aligned_binary_data(${COMPONENT_LIB}
                                "${classifier_model}"

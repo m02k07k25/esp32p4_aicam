@@ -1,18 +1,25 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
 from model_utils import (
     CHECKPOINT_PATH,
     IMAGE_SIZE,
+    INPUT_MEAN,
+    INPUT_STD,
+    MODEL_ARCHITECTURE,
     MODEL_WIDTH_MULT,
     NUM_CLASSES,
     ONNX_PATH,
+    PREPROCESS_PROFILE,
     build_model,
     checkpoint_state_dict,
     ensure_parent_dir,
+    file_sha256,
     load_labels,
+    validate_checkpoint_compatibility,
 )
 
 
@@ -36,20 +43,68 @@ def verify_onnx_shape(onnx_path: Path) -> None:
         raise ValueError(f"Unexpected input shape {dims}; expected [1, 3, {IMAGE_SIZE}, {IMAGE_SIZE}].")
 
 
+def add_onnx_metadata(
+    onnx_path: Path,
+    labels: list[str],
+    checkpoint_path: Path,
+    dataset_split: dict[str, object],
+) -> None:
+    import onnx
+
+    model = onnx.load(str(onnx_path))
+    metadata = {
+        "architecture": MODEL_ARCHITECTURE,
+        "width_mult": str(MODEL_WIDTH_MULT),
+        "image_size": str(IMAGE_SIZE),
+        "preprocess_profile": PREPROCESS_PROFILE,
+        "input_mean": json.dumps(list(INPUT_MEAN)),
+        "input_std": json.dumps(list(INPUT_STD)),
+        "labels": json.dumps(labels),
+        "source_checkpoint_sha256": file_sha256(checkpoint_path),
+        "dataset_split_manifest_sha256": str(
+            dataset_split["manifest_sha256"]
+        ),
+    }
+    del model.metadata_props[:]
+    for key, value in metadata.items():
+        entry = model.metadata_props.add()
+        entry.key = key
+        entry.value = value
+    onnx.save(model, str(onnx_path))
+
+
 def main() -> None:
     args = parse_args()
 
     import torch
 
     labels = load_labels()
-    checkpoint = torch.load(args.checkpoint, map_location="cpu")
-    checkpoint_labels = checkpoint.get("labels", labels)
+    checkpoint = torch.load(
+        args.checkpoint,
+        map_location="cpu",
+        weights_only=True,
+    )
+    checkpoint_labels = checkpoint.get("labels")
     if checkpoint_labels != labels:
         raise ValueError(f"Checkpoint labels {checkpoint_labels} do not match {labels}.")
-    checkpoint_width_mult = checkpoint.get("width_mult")
-    if checkpoint_width_mult is not None and float(checkpoint_width_mult) != MODEL_WIDTH_MULT:
+    expected_class_to_idx = {
+        label: index
+        for index, label in enumerate(labels)
+    }
+    if checkpoint.get("class_to_idx") != expected_class_to_idx:
         raise ValueError(
-            f"Checkpoint width_mult={checkpoint_width_mult} does not match current width_mult={MODEL_WIDTH_MULT}."
+            f"Checkpoint class_to_idx={checkpoint.get('class_to_idx')} does not "
+            f"match {expected_class_to_idx}."
+        )
+    validate_checkpoint_compatibility(checkpoint, args.checkpoint)
+    dataset_split = checkpoint.get("dataset_split")
+    if (
+        not isinstance(dataset_split, dict)
+        or not isinstance(dataset_split.get("manifest_sha256"), str)
+        or len(dataset_split["manifest_sha256"]) != 64
+    ):
+        raise ValueError(
+            f"Checkpoint {args.checkpoint} does not contain a valid dataset split digest."
         )
 
     model = build_model(num_classes=NUM_CLASSES, pretrained=False)
@@ -75,6 +130,13 @@ def main() -> None:
         input_names=["input"],
         output_names=["logits"],
         dynamic_axes=None,
+        dynamo=False,
+    )
+    add_onnx_metadata(
+        args.output,
+        labels,
+        args.checkpoint,
+        dataset_split,
     )
 
     if not args.skip_verify:

@@ -7,7 +7,7 @@ from io import BytesIO
 from pathlib import Path
 from urllib.request import Request, urlopen
 
-from model_utils import DOWNLOAD_ROOT, IMAGE_SIZE, load_labels
+from model_utils import DOWNLOAD_ROOT, IMAGE_SIZE, EspDlNearestResize, load_labels
 
 DEFAULT_OUTPUT_ROOT = DOWNLOAD_ROOT / "mountain_person"
 EXPECTED_LABELS = ["no_human", "human"]
@@ -87,8 +87,8 @@ def download_candidate(url: str, image_size: int):
     if image.width < image_size or image.height < image_size:
         return None
 
-    image = square_crop(image).resize((image_size, image_size))
-    return simulate_rgb565(image)
+    image = simulate_rgb565(square_crop(image))
+    return EspDlNearestResize((image_size, image_size))(image)
 
 
 def existing_digests(label_dir: Path) -> set[str]:

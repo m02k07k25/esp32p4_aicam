@@ -11,16 +11,22 @@
 idf.py -p PORT build flash monitor
 ```
 
-모델 파일을 새로 만들어야 한다면 먼저 아래 순서로 실행합니다.
+모델 파일을 새로 만들어야 한다면 `model/data/finetune_train/<label>/`에 원본 이미지를 넣고 아래 순서로 실행합니다. 첫 학습 단계는 공식 Keras MobileNetV2 0.35 백본을 고정하고, 두 번째 단계는 전체 네트워크를 파인튜닝합니다.
 
 ```powershell
-python model/train_model.py --epochs 20
+python model/prepare_finetune_split.py
+python model/download_pretrained.py
+python model/train_model.py --epochs 10 --freeze-features --output model/artifacts/checkpoints/stage1.pt
+python model/train_model.py --epochs 20 --lr 1e-5 --init-checkpoint model/artifacts/checkpoints/stage1.pt --output model/artifacts/checkpoints/best.pt
 python model/export_onnx.py
 python model/quantize_espdl.py
+python model/evaluate_test.py
 idf.py -p PORT build flash monitor
 ```
 
-모델 학습용 Python 환경과 데이터셋 준비 방법은 [model.md](model.md)를 확인하세요.
+기본 데이터 생성 경로는 `model/data/train`, `val`, `test`, `calib`이며 현재 수량은 각각 539/115/115/128장입니다. 매니페스트는 `model/data/split_manifest.json`이고, `calib` 128장은 train에서 클래스별 64장씩 복사됩니다. 원본을 변경한 뒤 재생성할 때는 `python model/prepare_finetune_split.py --replace-generated`를 사용합니다.
+
+공식 Keras MobileNetV2 0.35 H5 가중치는 TensorFlow 없이 PyTorch로 변환됩니다. `evaluate_test.py`는 학습 설정을 모두 확정한 뒤 마지막에 실행하세요. 모델 학습용 Python 환경, 자동 가중치 다운로드와 데이터 검증에 대한 자세한 설명은 [model.md](model.md)를 확인하세요.
 
 ## 개요
 
@@ -57,9 +63,26 @@ idf.py -p PORT build flash monitor
 
 ```text
 model/artifacts/espdl/classifier_224_p4.espdl
+model/artifacts/espdl/classifier_224_p4.espdl.json
 ```
 
-이 파일이 없으면 `main/CMakeLists.txt`에서 빌드가 중단됩니다. 펌웨어를 빌드하기 전에 `model/` 아래 스크립트로 모델을 생성해야 합니다.
+기본 `quantize_espdl.py`는 첫 bottleneck만 INT16, 나머지는 INT8인 mixed 프로파일을 생성합니다. 두 파일이 없거나 매니페스트의 0.35 모델·mixed INT8/INT16 프로파일·전처리·라벨·SHA-256 정보가 실제 모델과 다르면 `main/CMakeLists.txt`에서 빌드가 중단됩니다. 펌웨어를 빌드하기 전에 현재 `model/` 아래 스크립트로 모델을 다시 생성해야 합니다.
+
+## 현재 모델 검증 결과
+
+동일한 115장 test split에서 측정한 값입니다.
+
+| 실행 경로 | 판정 방식 | 정확도 |
+| --- | --- | ---: |
+| FP32 / ONNX | 단일 이미지 | 113/115 = 98.26% |
+| FP32 | 5개 half-crop, threshold 0.5 | 101/115 = 87.83% |
+| FP32 / ONNX | 5개 half-crop, val threshold `0.72482646` | 111/115 = 96.52% |
+| PPQ 순수 ESP-DL INT8 | 단일 이미지 | 48/115 = 41.74% |
+| PPQ mixed INT8/INT16 | 단일 이미지 | 111/115 = 96.52% |
+| PPQ mixed INT8/INT16 | 5개 half-crop, threshold 0.5 | 104/115 = 90.43% |
+| PPQ mixed INT8/INT16 | 5개 half-crop, val threshold `0.72482646` | 110/115 = 95.65% |
+
+양자화 결과는 ESP-PPQ fake-quant 시뮬레이션입니다. 아직 실제 ESP32-P4에서 `800x800 RGB565` 카메라 입력으로 측정한 값이 아니므로 보드 정확도와 지연시간은 별도로 검증해야 합니다. val에서 정한 threshold는 표시상 `0.72482646`이고, 펌웨어와 정확히 같은 float32 값은 `0.72482645511627197`입니다. 이 값은 `.espdl.json`에 기록되고 CMake가 컴파일 정의로 전달하므로 현재 펌웨어에도 같은 `>=` 판정이 적용됩니다.
 
 ## 프로젝트 설정
 
@@ -104,5 +127,5 @@ X-Inference-Total-Ms: 38.46
 ## 참고
 
 - 런타임 전처리는 `800x800` 프레임의 사분면 4개와 중앙 영역을 각각 `224x224`로 리사이즈해 5회 추론합니다.
-- 펌웨어 정규화 값은 torchvision ImageNet normalization과 맞춰져 있습니다.
+- 펌웨어 정규화 값은 Keras MobileNetV2의 RGB `x / 127.5 - 1` 전처리와 맞춰져 있습니다.
 - `model/labels.txt`와 `main/infer_config.h`의 2개 라벨 순서는 항상 같아야 합니다.

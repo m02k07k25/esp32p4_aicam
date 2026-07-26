@@ -7,11 +7,13 @@ import torch
 from PIL import Image
 
 from model_utils import (
+    CHECKPOINT_PATH,
     NUM_CLASSES,
     build_model,
     build_transforms,
     checkpoint_state_dict,
     load_labels,
+    validate_checkpoint_compatibility,
 )
 
 
@@ -21,7 +23,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--checkpoint",
         type=Path,
-        default=Path("artifacts/checkpoints/best.pt"),
+        default=CHECKPOINT_PATH,
     )
     return parser.parse_args()
 
@@ -38,7 +40,24 @@ def main() -> None:
         pretrained=False,
     ).to(device)
 
-    checkpoint = torch.load(args.checkpoint, map_location=device)
+    checkpoint = torch.load(
+        args.checkpoint,
+        map_location=device,
+        weights_only=True,
+    )
+    checkpoint_labels = checkpoint.get("labels")
+    if checkpoint_labels != labels:
+        raise ValueError(f"Checkpoint labels {checkpoint_labels} do not match {labels}.")
+    expected_class_to_idx = {
+        label: index
+        for index, label in enumerate(labels)
+    }
+    if checkpoint.get("class_to_idx") != expected_class_to_idx:
+        raise ValueError(
+            f"Checkpoint class_to_idx={checkpoint.get('class_to_idx')} does not "
+            f"match {expected_class_to_idx}."
+        )
+    validate_checkpoint_compatibility(checkpoint, args.checkpoint)
     model.load_state_dict(checkpoint_state_dict(checkpoint))
     model.eval()
 

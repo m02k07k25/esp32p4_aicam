@@ -1,15 +1,22 @@
 from __future__ import annotations
 
 import argparse
+import shutil
 from pathlib import Path
 
 from model_utils import (
     CHECKPOINT_PATH,
+    FixedOrderImageDataset,
     IMAGE_SIZE,
-    IMAGENET_MEAN,
-    IMAGENET_STD,
+    INPUT_MEAN,
+    INPUT_STD,
+    MODEL_ARCHITECTURE,
     MODEL_WIDTH_MULT,
     NUM_CLASSES,
+    PREPROCESS_PROFILE,
+    SPLIT_MANIFEST_PATH,
+    TRAIN_AUGMENTATION_CONFIG,
+    TRAIN_AUGMENTATION_PROFILE,
     TRAIN_ROOT,
     VAL_ROOT,
     build_model,
@@ -17,6 +24,8 @@ from model_utils import (
     checkpoint_state_dict,
     ensure_parent_dir,
     load_labels,
+    validate_checkpoint_compatibility,
+    validate_finetune_split,
     validate_split_directories,
 )
 
@@ -36,6 +45,12 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=VAL_ROOT,
         help="Validation data root.",
+    )
+    parser.add_argument(
+        "--split-manifest",
+        type=Path,
+        default=SPLIT_MANIFEST_PATH,
+        help="Manifest binding train/val/test files to this training run.",
     )
     parser.add_argument(
         "--output",
@@ -86,7 +101,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--no-pretrained",
         action="store_true",
-        help="Start from random weights instead of ImageNet weights.",
+        help="Start from random weights instead of the official Keras ImageNet 0.35 backbone.",
+    )
+    parser.add_argument(
+        "--pretrained-weights",
+        type=Path,
+        default=None,
+        help="Optional path to the official Keras MobileNetV2 0.35 no-top H5 file.",
+    )
+    parser.add_argument(
+        "--offline",
+        action="store_true",
+        help="Do not download pretrained weights; require an existing cached or explicit H5 file.",
+    )
+    parser.add_argument(
+        "--init-checkpoint",
+        type=Path,
+        default=None,
+        help="Load model weights only for a new fine-tuning run (new optimizer and epoch zero).",
     )
     parser.add_argument(
         "--resume",
@@ -123,23 +155,38 @@ def save_checkpoint(
     optimizer,
     epoch: int,
     val_accuracy: float,
+    val_loss: float,
     labels: list[str],
     class_to_idx: dict[str, int],
+    pretrained_provenance: dict | None,
+    freeze_features: bool,
+    dataset_split: dict[str, object],
 ) -> None:
     import torch
 
     checkpoint = {
+        "format_version": 2,
         "model_name": "mobilenet_v2",
+        "architecture": MODEL_ARCHITECTURE,
         "width_mult": MODEL_WIDTH_MULT,
         "image_size": IMAGE_SIZE,
+        "preprocess_profile": PREPROCESS_PROFILE,
         "labels": labels,
         "class_to_idx": class_to_idx,
         "normalization": {
-            "mean": list(IMAGENET_MEAN),
-            "std": list(IMAGENET_STD),
+            "mean": list(INPUT_MEAN),
+            "std": list(INPUT_STD),
         },
+        "pretrained": pretrained_provenance,
+        "training_config": {
+            "freeze_features": freeze_features,
+            "augmentation_profile": TRAIN_AUGMENTATION_PROFILE,
+            "augmentation": TRAIN_AUGMENTATION_CONFIG,
+        },
+        "dataset_split": dataset_split,
         "epoch": epoch,
         "val_accuracy": val_accuracy,
+        "val_loss": val_loss,
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
     }
@@ -154,52 +201,52 @@ def main() -> None:
     import torch
     from torch import nn
     from torch.utils.data import DataLoader
-    from torchvision import datasets
 
     if args.patience < 1:
         raise ValueError("--patience must be at least 1.")
+    if args.epochs < 1:
+        raise ValueError("--epochs must be at least 1.")
+    if args.resume is not None and args.init_checkpoint is not None:
+        raise ValueError("--resume and --init-checkpoint are mutually exclusive.")
+    if args.pretrained_weights is not None and (
+        args.no_pretrained or args.resume is not None or args.init_checkpoint is not None
+    ):
+        raise ValueError(
+            "--pretrained-weights cannot be combined with --no-pretrained, "
+            "--resume, or --init-checkpoint."
+        )
 
     labels = load_labels()
+    split_root = args.split_manifest.parent
+    expected_train_dir = (split_root / "train").resolve()
+    expected_val_dir = (split_root / "val").resolve()
+    if args.train_dir.resolve() != expected_train_dir:
+        raise ValueError(
+            f"--train-dir must be {expected_train_dir} for "
+            f"--split-manifest {args.split_manifest}."
+        )
+    if args.val_dir.resolve() != expected_val_dir:
+        raise ValueError(
+            f"--val-dir must be {expected_val_dir} for "
+            f"--split-manifest {args.split_manifest}."
+        )
+    dataset_split = validate_finetune_split(
+        split_root,
+        args.split_manifest,
+        labels,
+    )
     validate_split_directories(args.train_dir, labels)
     validate_split_directories(args.val_dir, labels)
-
-    class FixedOrderImageFolder(datasets.ImageFolder):
-        def __init__(
-            self,
-            root: Path,
-            ordered_labels: list[str],
-            **kwargs,
-        ):
-            self._ordered_labels = ordered_labels
-            super().__init__(str(root), **kwargs)
-
-        def find_classes(self, directory: str):
-            classes = []
-
-            for label in self._ordered_labels:
-                label_dir = Path(directory) / label
-
-                if not label_dir.is_dir():
-                    raise FileNotFoundError(
-                        f"Missing class directory: {label_dir}"
-                    )
-
-                classes.append(label)
-
-            return classes, {
-                label: idx
-                for idx, label in enumerate(classes)
-            }
 
     torch.manual_seed(args.seed)
     device = resolve_device(args.device)
 
-    train_dataset = FixedOrderImageFolder(
+    train_dataset = FixedOrderImageDataset(
         args.train_dir,
         labels,
         transform=build_transforms(train=True),
     )
-    val_dataset = FixedOrderImageFolder(
+    val_dataset = FixedOrderImageDataset(
         args.val_dir,
         labels,
         transform=build_transforms(train=False),
@@ -230,12 +277,86 @@ def main() -> None:
         pin_memory=device.type == "cuda",
     )
 
+    use_keras_pretrained = (
+        not args.no_pretrained
+        and args.resume is None
+        and args.init_checkpoint is None
+    )
     model = build_model(
         num_classes=NUM_CLASSES,
-        pretrained=not args.no_pretrained,
+        pretrained=use_keras_pretrained,
+        pretrained_weights_path=args.pretrained_weights,
+        allow_download=not args.offline,
     ).to(device)
 
+    pretrained_provenance = getattr(model, "pretrained_provenance", None)
+    loaded_checkpoint = None
+    checkpoint_path = args.resume or args.init_checkpoint
+    if checkpoint_path is not None:
+        loaded_checkpoint = torch.load(
+            checkpoint_path,
+            map_location=device,
+            weights_only=True,
+        )
+        checkpoint_labels = loaded_checkpoint.get("labels")
+        if checkpoint_labels != labels:
+            raise ValueError(
+                f"Checkpoint labels {checkpoint_labels} do not match {labels}."
+            )
+        checkpoint_class_to_idx = loaded_checkpoint.get("class_to_idx")
+        if checkpoint_class_to_idx != train_dataset.class_to_idx:
+            raise ValueError(
+                f"Checkpoint class_to_idx={checkpoint_class_to_idx} does not match "
+                f"{train_dataset.class_to_idx}."
+            )
+        validate_checkpoint_compatibility(loaded_checkpoint, checkpoint_path)
+        saved_dataset_split = loaded_checkpoint.get("dataset_split")
+        if (
+            not isinstance(saved_dataset_split, dict)
+            or saved_dataset_split.get("manifest_sha256")
+            != dataset_split["manifest_sha256"]
+        ):
+            operation = "resume" if args.resume is not None else "initialize"
+            raise ValueError(
+                f"Checkpoint {checkpoint_path} cannot {operation} this run because "
+                "it was trained with a different or unrecorded dataset split. "
+                "Reusing it could leak current test images into the model."
+            )
+        if args.resume is not None:
+            training_config = loaded_checkpoint.get("training_config", {})
+            saved_freeze_features = training_config.get("freeze_features")
+            if not isinstance(saved_freeze_features, bool):
+                raise ValueError(
+                    f"Checkpoint {checkpoint_path} does not record freeze_features, "
+                    "so it cannot be resumed safely. Use --init-checkpoint to load "
+                    "its model weights into a new training run."
+                )
+            if saved_freeze_features != args.freeze_features:
+                raise ValueError(
+                    f"Checkpoint {checkpoint_path} was saved with "
+                    f"freeze_features={saved_freeze_features}, but this run uses "
+                    f"freeze_features={args.freeze_features}. Keep the same setting "
+                    "for --resume, or use --init-checkpoint for a new optimizer."
+                )
+            saved_augmentation_profile = training_config.get(
+                "augmentation_profile"
+            )
+            if saved_augmentation_profile != TRAIN_AUGMENTATION_PROFILE:
+                raise ValueError(
+                    f"Checkpoint {checkpoint_path} uses augmentation profile "
+                    f"{saved_augmentation_profile!r}, but this run uses "
+                    f"{TRAIN_AUGMENTATION_PROFILE!r}. Use --init-checkpoint "
+                    "to start a new optimizer with the current augmentation."
+                )
+        model.load_state_dict(checkpoint_state_dict(loaded_checkpoint))
+        pretrained_provenance = loaded_checkpoint.get("pretrained")
+
     if args.freeze_features:
+        if not use_keras_pretrained and loaded_checkpoint is None:
+            raise ValueError(
+                "--freeze-features requires pretrained weights or a compatible checkpoint; "
+                "refusing to freeze a random backbone."
+            )
         for parameter in model.features.parameters():
             parameter.requires_grad = False
 
@@ -252,53 +373,70 @@ def main() -> None:
     )
 
     start_epoch = 0
-    best_val_accuracy = 0.0
+    best_val_accuracy = float("-inf")
+    best_val_loss = float("inf")
     epochs_without_improvement = 0
+    best_checkpoint_path = args.resume if args.resume is not None else args.output
+
+    if loaded_checkpoint is not None:
+        best_val_accuracy = float(
+            loaded_checkpoint.get("val_accuracy", float("-inf"))
+        )
+        best_val_loss = float(
+            loaded_checkpoint.get("val_loss", float("inf"))
+        )
+        best_checkpoint_path = checkpoint_path
+
+    if (
+        args.init_checkpoint is not None
+        and args.init_checkpoint.resolve() != args.output.resolve()
+    ):
+        ensure_parent_dir(args.output)
+        shutil.copy2(args.init_checkpoint, args.output)
+        best_checkpoint_path = args.output
+        print(
+            f"Copied the validated initialization baseline to {args.output}."
+        )
 
     if args.resume is not None:
-        checkpoint = torch.load(
-            args.resume,
-            map_location=device,
-        )
-
-        checkpoint_labels = checkpoint.get(
-            "labels",
-            labels,
-        )
-
-        if checkpoint_labels != labels:
+        assert loaded_checkpoint is not None
+        if "optimizer_state_dict" not in loaded_checkpoint:
             raise ValueError(
-                f"Checkpoint labels {checkpoint_labels} "
-                f"do not match {labels}."
+                f"Checkpoint {args.resume} has no optimizer_state_dict and cannot "
+                "be resumed safely. Use --init-checkpoint for a new optimizer."
             )
-
-        model.load_state_dict(
-            checkpoint_state_dict(checkpoint)
+        optimizer.load_state_dict(
+            loaded_checkpoint["optimizer_state_dict"]
         )
-
-        if "optimizer_state_dict" in checkpoint:
-            optimizer.load_state_dict(
-                checkpoint["optimizer_state_dict"]
-            )
 
         start_epoch = int(
-            checkpoint.get("epoch", 0)
+            loaded_checkpoint.get("epoch", 0)
         )
-        best_val_accuracy = float(
-            checkpoint.get("val_accuracy", 0.0)
-        )
-
     print(
         f"Training on {device} with "
         f"{len(train_dataset)} train images and "
         f"{len(val_dataset)} val images."
     )
+    print(f"Training augmentation: {TRAIN_AUGMENTATION_PROFILE}")
+    if args.resume is not None:
+        print(f"Resumed model, optimizer, and epoch state from {args.resume}.")
+    elif args.init_checkpoint is not None:
+        print(f"Initialized model weights from {args.init_checkpoint}.")
+    elif pretrained_provenance is not None:
+        print(
+            "Initialized the backbone from official Keras MobileNetV2 0.35 "
+            f"weights (sha256={pretrained_provenance['sha256']})."
+        )
+    else:
+        print("Initialized the model from random weights.")
     print(
         f"Early stopping patience: {args.patience}"
     )
 
     for epoch in range(start_epoch, args.epochs):
         model.train()
+        if args.freeze_features:
+            model.features.eval()
 
         train_loss = 0.0
         train_correct = 0
@@ -362,8 +500,16 @@ def main() -> None:
             f"val_acc={val_accuracy:.4f}"
         )
 
-        if val_accuracy > best_val_accuracy:
+        validation_improved = (
+            val_accuracy > best_val_accuracy
+            or (
+                val_accuracy == best_val_accuracy
+                and val_loss < best_val_loss
+            )
+        )
+        if validation_improved:
             best_val_accuracy = val_accuracy
+            best_val_loss = val_loss
             epochs_without_improvement = 0
 
             save_checkpoint(
@@ -372,13 +518,18 @@ def main() -> None:
                 optimizer,
                 epoch + 1,
                 val_accuracy,
+                val_loss,
                 labels,
                 train_dataset.class_to_idx,
+                pretrained_provenance,
+                args.freeze_features,
+                dataset_split,
             )
+            best_checkpoint_path = args.output
 
             print(
                 f"Saved best checkpoint to {args.output} "
-                f"(val_acc={val_accuracy:.4f})"
+                f"(val_acc={val_accuracy:.4f}, val_loss={val_loss:.4f})"
             )
 
         else:
@@ -396,16 +547,18 @@ def main() -> None:
             ):
                 print(
                     f"Early stopping at epoch {epoch + 1}. "
-                    f"Best val_acc={best_val_accuracy:.4f}"
+                    f"Best val_acc={best_val_accuracy:.4f}, "
+                    f"val_loss={best_val_loss:.4f}"
                 )
                 break
 
     print(
         f"Training finished. "
-        f"Best val_acc={best_val_accuracy:.4f}"
+        f"Best val_acc={best_val_accuracy:.4f}, "
+        f"val_loss={best_val_loss:.4f}"
     )
     print(
-        f"Best checkpoint: {args.output}"
+        f"Best checkpoint: {best_checkpoint_path}"
     )
 
 
