@@ -442,9 +442,11 @@ static esp_err_t classify_handler(httpd_req_t *req)
              total_ms,
              (unsigned int)jpeg_len);
 
-    esp_err_t sdio_ret = sdio_frame_tx_send_classification(jpeg_ptr, jpeg_len, &infer_result, total_ms);
-    if (sdio_ret != ESP_OK) {
-        ESP_LOGW(TAG, "SDIO frame send skipped/failed: %s", esp_err_to_name(sdio_ret));
+    esp_err_t sdio_ret =
+        sdio_frame_tx_submit_classification(jpeg_ptr, jpeg_len, &infer_result, total_ms);
+    if (sdio_ret != ESP_OK && sdio_ret != ESP_ERR_NOT_SUPPORTED &&
+        sdio_ret != ESP_ERR_INVALID_STATE) {
+        ESP_LOGW(TAG, "SDIO frame queue failed: %s", esp_err_to_name(sdio_ret));
     }
 
     res = httpd_resp_send_chunk(req, (const char *)jpeg_ptr, jpeg_len);
@@ -689,6 +691,10 @@ void app_main(void)
     }
 
     ESP_ERROR_CHECK(infer_bridge_init());
+    esp_err_t sdio_ret = sdio_frame_tx_init();
+    if (sdio_ret != ESP_OK && sdio_ret != ESP_ERR_NOT_SUPPORTED) {
+        ESP_LOGW(TAG, "Failed to start optional SDIO frame sender: %s", esp_err_to_name(sdio_ret));
+    }
     ESP_ERROR_CHECK(start_cam_web_server(index, video_cam_fd));
     ESP_LOGI(TAG, "Example Start");
 }

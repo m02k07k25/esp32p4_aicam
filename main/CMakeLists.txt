@@ -38,7 +38,8 @@ idf_component_register(SRCS ${srcs}
                                      heap
                                      log
                                      esp_common
-                                     esp_hosted)
+                                     esp_hosted
+                                     sdio_frame_protocol)
 
 target_compile_definitions(${COMPONENT_LIB} PRIVATE
                            CLASSIFIER_FIVE_CROP_HUMAN_THRESHOLD=${CLASSIFIER_FIVE_CROP_HUMAN_THRESHOLD})
