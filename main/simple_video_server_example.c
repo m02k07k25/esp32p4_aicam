@@ -41,9 +41,6 @@
 #include "driver/jpeg_encode.h"
 #include "mdns.h"
 #include "lwip/apps/netbiosns.h"
-#include "infer_bridge.h"
-#include "infer_config.h"
-#include "sdio_frame_tx.h"
 
 // video frame buffer count, too large value may cause memory allocation fails.
 #define EXAMPLE_VIDEO_BUFFER_COUNT   2
@@ -633,10 +630,62 @@ static jpeg_enc_input_format_t get_jpeg_enc_input_fmt(uint32_t video_fmt)
     return ret_fmt;
 }
 
+/*
+ * VIDIOC_STREAMON keeps capturing while the application is idle, but the
+ * driver stops advancing once every queued buffer is full.  At that point a
+ * plain VIDIOC_DQBUF returns the oldest completed frame, which can be seconds
+ * or minutes older than the capture request.  Recycle one complete buffer
+ * cycle first, then wait for the next frame produced after this request.
+ *
+ * The caller must hold wc->lock and must requeue fresh_buf when finished.
+ */
+static esp_err_t dequeue_fresh_video_frame_locked(web_cam_t *wc, struct v4l2_buffer *fresh_buf)
+{
+    for (size_t i = 0; i < ARRAY_SIZE(wc->buffer); i++) {
+        struct v4l2_buffer stale_buf;
+
+        memset(&stale_buf, 0, sizeof(stale_buf));
+        stale_buf.type = s_queue_buf_type;
+        stale_buf.memory = MEMORY_TYPE;
+
+        if (ioctl(wc->fd, VIDIOC_DQBUF, &stale_buf) != 0) {
+            ESP_LOGE(TAG, "failed to dequeue stale video frame");
+            return ESP_FAIL;
+        }
+        if (ioctl(wc->fd, VIDIOC_QBUF, &stale_buf) != 0) {
+            ESP_LOGE(TAG, "failed to requeue stale video frame");
+            return ESP_FAIL;
+        }
+    }
+
+    memset(fresh_buf, 0, sizeof(*fresh_buf));
+    fresh_buf->type = s_queue_buf_type;
+    fresh_buf->memory = MEMORY_TYPE;
+    if (ioctl(wc->fd, VIDIOC_DQBUF, fresh_buf) != 0) {
+        ESP_LOGE(TAG, "failed to receive fresh video frame");
+        return ESP_FAIL;
+    }
+
+    if (fresh_buf->index >= ARRAY_SIZE(wc->buffer) ||
+        fresh_buf->bytesused == 0 ||
+        (fresh_buf->flags & V4L2_BUF_FLAG_ERROR) != 0) {
+        ESP_LOGE(TAG,
+                 "invalid fresh video frame: index=%u bytes=%u flags=0x%x",
+                 (unsigned int)fresh_buf->index,
+                 (unsigned int)fresh_buf->bytesused,
+                 (unsigned int)fresh_buf->flags);
+        if (ioctl(wc->fd, VIDIOC_QBUF, fresh_buf) != 0) {
+            ESP_LOGE(TAG, "failed to requeue invalid video frame");
+        }
+        return ESP_FAIL;
+    }
+
+    return ESP_OK;
+}
+
 static esp_err_t record_bin_handler(httpd_req_t *req)
 {
     esp_err_t res = ESP_FAIL;
-    int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     struct v4l2_buffer buf;
     web_cam_t *wc = (web_cam_t *)req->user_ctx;
 
@@ -648,11 +697,8 @@ static esp_err_t record_bin_handler(httpd_req_t *req)
         return ESP_ERR_TIMEOUT;
     }
 
-    memset(&buf, 0, sizeof(buf));
-    buf.type   = type;
-    buf.memory = MEMORY_TYPE;
-    res = ioctl(wc->fd, VIDIOC_DQBUF, &buf);
-    if (res == 0) {
+    res = dequeue_fresh_video_frame_locked(wc, &buf);
+    if (res == ESP_OK) {
         res = httpd_resp_send_chunk(req, (const char *)wc->buffer[buf.index], buf.bytesused);
         if (res != ESP_OK) {
             ESP_LOGW(TAG, "chunk send failed");
@@ -691,11 +737,8 @@ static esp_err_t pic_handler(httpd_req_t *req)
         return ESP_ERR_TIMEOUT;
     }
 
-    memset(&buf, 0, sizeof(buf));
-    buf.type   = s_queue_buf_type;
-    buf.memory = MEMORY_TYPE;
-    res = ioctl(wc->fd, VIDIOC_DQBUF, &buf);
-    if (res == 0) {
+    res = dequeue_fresh_video_frame_locked(wc, &buf);
+    if (res == ESP_OK) {
         if (wc->pixel_format == V4L2_PIX_FMT_JPEG) {
             jpeg_ptr = wc->buffer[buf.index];
             jpeg_size = buf.bytesused;
@@ -781,13 +824,10 @@ static esp_err_t capture_jpeg_frame(web_cam_t *wc,
         return ESP_ERR_TIMEOUT;
     }
 
-    memset(&buf, 0, sizeof(buf));
-    buf.type = s_queue_buf_type;
-    buf.memory = MEMORY_TYPE;
-    if (ioctl(wc->fd, VIDIOC_DQBUF, &buf) != 0) {
-        ESP_LOGE(TAG, "failed to receive video frame");
+    ret = dequeue_fresh_video_frame_locked(wc, &buf);
+    if (ret != ESP_OK) {
         xSemaphoreGive(wc->lock);
-        return ESP_FAIL;
+        return ret;
     }
 
     ret = encode_frame_to_jpeg(wc, wc->buffer[buf.index], buf.bytesused, jpeg_quality, &jpeg_ptr, &jpeg_len);
@@ -1069,96 +1109,6 @@ static esp_err_t photo_handler(httpd_req_t *req)
     return ret;
 }
 
-static esp_err_t classify_handler(httpd_req_t *req)
-{
-    esp_err_t res = ESP_FAIL;
-    struct v4l2_buffer buf;
-    uint8_t *jpeg_ptr = NULL;
-    size_t jpeg_len = 0;
-    infer_result_t infer_result = {0};
-    float total_ms = 0;
-    web_cam_t *wc = (web_cam_t *)req->user_ctx;
-    int64_t req_start_us = esp_timer_get_time();
-
-    if (wc->pixel_format != EXAMPLE_VIDEO_FMT_RGB565) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Classifier handler requires RGB565 camera format");
-        return ESP_FAIL;
-    }
-
-    httpd_resp_set_type(req, "image/jpeg");
-    httpd_resp_set_hdr(req, "Content-Disposition", "inline; filename=classify.jpg");
-    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-
-    if (xSemaphoreTake(wc->lock, pdMS_TO_TICKS(10000)) != pdTRUE) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "camera busy");
-        return ESP_ERR_TIMEOUT;
-    }
-
-    memset(&buf, 0, sizeof(buf));
-    buf.type = s_queue_buf_type;
-    buf.memory = MEMORY_TYPE;
-    res = ioctl(wc->fd, VIDIOC_DQBUF, &buf);
-    if (res != 0) {
-        ESP_LOGE(TAG, "failed to receive video frame");
-        xSemaphoreGive(wc->lock);
-        return ESP_FAIL;
-    }
-
-    res = infer_bridge_process_rgb565(wc->buffer[buf.index], wc->width, wc->height, &infer_result);
-    if (res == ESP_OK) {
-        res = encode_frame_to_jpeg(
-            wc, wc->buffer[buf.index], buf.bytesused, INFER_CLASSIFY_JPEG_QUALITY, &jpeg_ptr, &jpeg_len);
-    }
-
-    if (ioctl(wc->fd, VIDIOC_QBUF, &buf) != 0) {
-        ESP_LOGE(TAG, "failed to free video frame");
-    }
-    xSemaphoreGive(wc->lock);
-
-    if (res != ESP_OK) {
-        ESP_LOGE(TAG, "classification failed (%s)", esp_err_to_name(res));
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "classification failed");
-        return res;
-    }
-
-    /* httpd_resp_set_hdr() keeps header value pointers until send time. */
-    char class_id_hdr[32];
-    char score_hdr[32];
-    char inference_ms_hdr[32];
-    char total_ms_hdr[32];
-    snprintf(class_id_hdr, sizeof(class_id_hdr), "%d", infer_result.class_id);
-    httpd_resp_set_hdr(req, "X-Class-Index", class_id_hdr);
-    httpd_resp_set_hdr(req, "X-Class-Label", infer_result.class_name);
-    snprintf(score_hdr, sizeof(score_hdr), "%.4f", infer_result.score);
-    httpd_resp_set_hdr(req, "X-Class-Score", score_hdr);
-    snprintf(inference_ms_hdr, sizeof(inference_ms_hdr), "%.2f", infer_result.inference_ms);
-    httpd_resp_set_hdr(req, "X-Inference-Time-Ms", inference_ms_hdr);
-    total_ms = (float)(esp_timer_get_time() - req_start_us) / 1000.0f;
-    snprintf(total_ms_hdr, sizeof(total_ms_hdr), "%.2f", total_ms);
-    httpd_resp_set_hdr(req, "X-Inference-Total-Ms", total_ms_hdr);
-    ESP_LOGI(TAG,
-             "classification done: class=%d (%s), score=%.4f, inference=%.2f ms, total=%.2f ms, jpeg=%u B",
-             infer_result.class_id,
-             infer_result.class_name,
-             infer_result.score,
-             infer_result.inference_ms,
-             total_ms,
-             (unsigned int)jpeg_len);
-
-    esp_err_t sdio_ret = sdio_frame_tx_send_classification(jpeg_ptr, jpeg_len, &infer_result, total_ms);
-    if (sdio_ret != ESP_OK) {
-        ESP_LOGW(TAG, "SDIO frame send skipped/failed: %s", esp_err_to_name(sdio_ret));
-    }
-
-    res = httpd_resp_send_chunk(req, (const char *)jpeg_ptr, jpeg_len);
-    if (res != ESP_OK) {
-        ESP_LOGE(TAG, "send classify chunk failed");
-        return res;
-    }
-
-    return httpd_resp_send_chunk(req, NULL, 0);
-}
-
 static esp_err_t root_handler(httpd_req_t *req)
 {
     httpd_resp_set_status(req, "303 See Other");
@@ -1319,12 +1269,6 @@ static esp_err_t http_server_init(int index, web_cam_t *web_cam)
         .handler = record_bin_handler,
         .user_ctx = (void *)web_cam,
     };
-    httpd_uri_t classify_get_uri = {
-        .uri = "/classify.jpg",
-        .method = HTTP_GET,
-        .handler = classify_handler,
-        .user_ctx = (void *)web_cam
-    };
     httpd_uri_t capture_get_uri = {
         .uri = "/capture",
         .method = HTTP_GET,
@@ -1353,13 +1297,12 @@ static esp_err_t http_server_init(int index, web_cam_t *web_cam)
     ESP_ERROR_CHECK(httpd_register_uri_handler(video_web_httpd, &root_get_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(video_web_httpd, &pic_get_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(video_web_httpd, &record_file_get_uri));
-    ESP_ERROR_CHECK(httpd_register_uri_handler(video_web_httpd, &classify_get_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(video_web_httpd, &capture_get_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(video_web_httpd, &captures_get_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(video_web_httpd, &photo_get_uri));
 
     ESP_LOGI(TAG,
-             "Starting HTTP server on port: '%d' (/, /pic, /record, /classify.jpg, /capture, /captures, /photo)",
+             "Starting HTTP server on port: '%d' (/, /pic, /record, /capture, /captures, /photo)",
              config.server_port);
 
     return ESP_OK;
@@ -1446,7 +1389,6 @@ void app_main(void)
         return;
     }
 
-    ESP_ERROR_CHECK(infer_bridge_init());
     ESP_ERROR_CHECK(start_cam_web_server(index, video_cam_fd));
     ESP_LOGI(TAG, "Example Start");
 }
