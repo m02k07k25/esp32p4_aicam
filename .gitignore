@@ -7,9 +7,17 @@ download/
 model/artifacts/checkpoints/*.pt
 model/artifacts/onnx/*.onnx
 model/artifacts/espdl/*.espdl
+model/artifacts/espdl/*.espdl.json
+model/artifacts/espdl/*.info
+model/artifacts/espdl/*.json
+!model/artifacts/espdl/classifier_224_p4.espdl
+!model/artifacts/espdl/classifier_224_p4.espdl.json
+model/artifacts/evaluation/*.csv
 model/data/calib/*
 model/data/train/*
 model/data/val/*
+model/data/test/*
+model/data/split_manifest.json
 !model/data/calib/.gitkeep
 !model/data/train/no_human/
 !model/data/train/human/
@@ -19,6 +27,10 @@ model/data/val/*
 !model/data/val/human/
 !model/data/val/no_human/.gitkeep
 !model/data/val/human/.gitkeep
+!model/data/test/no_human/
+!model/data/test/human/
+!model/data/test/no_human/.gitkeep
+!model/data/test/human/.gitkeep
 *.jpg
 *.jpeg
 *.png
@@ -27,3 +39,8 @@ dist/
 build*
 sdkconfig
 sdkconfig.old
+managed_components/
+
+# This project uses protocol_examples_common through ${IDF_PATH}; its generated
+# lock contains a machine-specific absolute path and is regenerated locally.
+firmware/p4_inference/dependencies.lock

@@ -1,78 +1,38 @@
-# 모델 학습 및 변환
+# 모델 학습과 변환
 
-아래 순서대로 실행하면 데이터 준비, 학습, ONNX 내보내기, ESP-DL 양자화까지 진행됩니다.
+`model/`은 펌웨어 빌드와 분리된 Python 작업공간입니다. 입력 데이터는 `model/data/finetune_train/<label>/`에 준비하고, 생성되는 split·체크포인트·ONNX·평가 CSV는 기본적으로 Git에 포함하지 않습니다.
+
+## 환경 예시
 
 ```powershell
 python -m venv .venv
 & .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-pip install onnx pillow esp-ppq
-
-python model/prepare_coco_human_dataset.py
-python model/train_model.py --epochs 20
-python model/export_onnx.py
-python model/quantize_espdl.py
+pip install onnx pillow h5py esp-ppq ddgs
 ```
 
-이미 `.venv`와 데이터셋이 준비되어 있다면 아래 3개만 다시 실행하면 됩니다.
+## 권장 순서
 
 ```powershell
-python model/train_model.py --epochs 20
+python model/prepare_finetune_split.py
+python model/download_pretrained.py
+python model/train_model.py --epochs 10 --freeze-features --output model/artifacts/checkpoints/stage1.pt
+python model/train_model.py --epochs 20 --lr 1e-5 --init-checkpoint model/artifacts/checkpoints/stage1.pt --output model/artifacts/checkpoints/best.pt
 python model/export_onnx.py
 python model/quantize_espdl.py
+python model/evaluate_test.py
 ```
 
-## 개요
+`prepare_finetune_split.py`는 train/val/test를 만들고 train에서 calibration 샘플을 선택합니다. 기존 생성 split을 의도적으로 교체할 때만 `--replace-generated`를 사용합니다.
 
-이 폴더는 펌웨어에서 사용하는 `224x224` 2클래스 MobileNetV2 0.35-width 분류 모델을 학습하고 변환하는 작업 공간입니다.
-
-최종 펌웨어가 사용하는 파일은 다음 경로에 생성됩니다.
+최종 펌웨어 입력은 다음 파일 쌍입니다.
 
 ```text
 model/artifacts/espdl/classifier_224_p4.espdl
+model/artifacts/espdl/classifier_224_p4.espdl.json
 ```
 
-## 라벨
+매니페스트는 구조, 입력 크기, 라벨 순서, 전처리, five-crop 결정 규칙, mixed INT8/INT16 설정 및 `.espdl` SHA-256을 기록합니다. `firmware/p4_inference/main/classifier_manifest.cmake`가 빌드 전에 이 정보를 검증합니다.
 
-`labels.txt`가 클래스 순서의 기준입니다. 기본 라벨은 다음과 같습니다.
-
-```text
-no_human
-human
-```
-
-이 순서는 펌웨어 쪽 라벨 정의와 맞아야 합니다.
-
-## 폴더 구조
-
-```text
-model/
-  labels.txt
-  train_model.py
-  export_onnx.py
-  quantize_espdl.py
-  data/
-    train/<label>/*.jpg
-    val/<label>/*.jpg
-    calib/**/*.jpg
-  artifacts/
-    checkpoints/best.pt
-    onnx/classifier_224.onnx
-    espdl/classifier_224_p4.espdl
-```
-
-`data/train`과 `data/val`에는 `labels.txt`에 있는 라벨명과 같은 폴더가 있어야 합니다.
-
-## 스크립트 역할
-
-- `prepare_coco_human_dataset.py`: COCO에서 `human / no_human` 학습용 샘플을 내려받아 `model/data`에 배치합니다.
-- `train_model.py`: MobileNetV2 0.35-width 모델을 학습하고 `artifacts/checkpoints/best.pt`를 저장합니다.
-- `export_onnx.py`: 학습된 체크포인트를 `artifacts/onnx/classifier_224.onnx`로 내보냅니다.
-- `quantize_espdl.py`: ONNX 모델을 ESP-DL용 int8 모델인 `artifacts/espdl/classifier_224_p4.espdl`로 변환합니다.
-
-## 주의사항
-
-모델 도구는 프로젝트 로컬 `.venv`에서 실행하세요. ESP-IDF가 사용하는 Python 환경과 섞지 않는 것이 좋습니다.
-
-MobileNetV2 0.35-width는 torchvision의 기본 ImageNet pretrained weight와 구조가 달라서 랜덤 초기화로 학습됩니다. 기존 1.0-width 체크포인트는 이 설정에서 그대로 사용할 수 없으므로 모델 변경 후에는 학습부터 다시 실행해야 합니다.
+현재 모델은 MobileNetV2 0.35-width, 224x224 입력, `no_human`/`human` 두 클래스와 mixed INT8/INT16 양자화를 사용합니다. `model/legacy/augment_dataset.py`는 이전 브랜치에만 있던 데이터 증강 도구를 보존한 것이며 기본 학습 흐름에서는 호출하지 않습니다.

@@ -1,0 +1,246 @@
+menu "Example Configuration"
+
+    config EXAMPLE_ENABLE_MIPI_CSI_CAM_SENSOR
+        bool "Enable MIPI CSI Camera Sensor"
+        default y
+        depends on ESP_VIDEO_ENABLE_MIPI_CSI_VIDEO_DEVICE
+
+    if EXAMPLE_ENABLE_MIPI_CSI_CAM_SENSOR
+        config EXAMPLE_MIPI_CSI_SCCB_I2C_PORT
+            int "MIPI CSI SCCB I2C Port Number"
+            default 0
+            range 0 1
+
+        config EXAMPLE_MIPI_CSI_SCCB_I2C_SCL_PIN
+            int "MIPI CSI SCCB I2C SCL Pin"
+            default 8
+            range -1 56
+
+        config EXAMPLE_MIPI_CSI_SCCB_I2C_SDA_PIN
+            int "MIPI CSI SCCB I2C SDA Pin"
+            default 7
+            range -1 56
+
+        config EXAMPLE_MIPI_CSI_SCCB_I2C_FREQ
+            int "MIPI CSI SCCB I2C Frequency"
+            default 100000
+            range 100000 400000
+            help
+                Increasing this value can reduce the initialization time of the camera sensor.
+                Please refer to the relevant instructions of the camera sensor to adjust the value.
+
+        config EXAMPLE_MIPI_CSI_CAM_SENSOR_RESET_PIN
+            int "MIPI CSI Camera Sensor Reset Pin"
+            default -1
+            range -1 56
+
+        config EXAMPLE_MIPI_CSI_CAM_SENSOR_PWDN_PIN
+            int "MIPI CSI Camera Sensor Power Down Pin"
+            default -1
+            range -1 56
+    endif
+
+    config EXAMPLE_ENABLE_DVP_CAM_SENSOR
+        bool "Enable DVP Camera Sensor"
+        default n
+        depends on ESP_VIDEO_ENABLE_DVP_VIDEO_DEVICE
+
+    if EXAMPLE_ENABLE_DVP_CAM_SENSOR
+        config EXAMPLE_DVP_SCCB_I2C_PORT
+            int "DVP SCCB I2C Port Number"
+            default 1
+            range 0 1
+
+        config EXAMPLE_DVP_SCCB_I2C_SCL_PIN
+            int "DVP SCCB I2C SCL Pin"
+            default 33
+            range -1 56
+
+        config EXAMPLE_DVP_SCCB_I2C_SDA_PIN
+            int "DVP SCCB I2C SDA Pin"
+            default 32
+            range -1 56
+
+        config EXAMPLE_DVP_SCCB_I2C_FREQ
+            int "DVP SCCB I2C Frequency"
+            default 100000
+            range 100000 400000
+            help
+                Increasing this value can reduce the initialization time of the camera sensor.
+                Please refer to the relevant instructions of the camera sensor to adjust the value.
+
+        config EXAMPLE_DVP_CAM_SENSOR_RESET_PIN
+            int "DVP Camera Sensor Reset Pin"
+            default -1
+            range -1 56
+
+        config EXAMPLE_DVP_CAM_SENSOR_PWDN_PIN
+            int "DVP Camera Sensor Power Down Pin"
+            default -1
+            range -1 56
+
+        config EXAMPLE_DVP_XCLK_FREQ
+            int "DVP XCLK Frequency"
+            default 20000000
+
+        config EXAMPLE_DVP_XCLK_PIN
+            int "DVP XCLK Pin"
+            range 0 56
+            default 20
+
+        config EXAMPLE_DVP_PCLK_PIN
+            int "DVP PCLK Pin"
+            range 0 56
+            default 21
+
+        config EXAMPLE_DVP_VSYNC_PIN
+            int "DVP VSYNC Pin"
+            range 0 56
+            default 23
+
+        config EXAMPLE_DVP_DE_PIN
+            int "DVP DE Pin"
+            range 0 56
+            default 22
+
+        config EXAMPLE_DVP_D0_PIN
+            int "DVP D0 Pin"
+            range 0 56
+            default 53
+
+        config EXAMPLE_DVP_D1_PIN
+            int "DVP D1 Pin"
+            range 0 56
+            default 54
+
+        config EXAMPLE_DVP_D2_PIN
+            int "DVP D2 Pin"
+            range 0 56
+            default 52
+
+        config EXAMPLE_DVP_D3_PIN
+            int "DVP D3 Pin"
+            range 0 56
+            default 1
+
+        config EXAMPLE_DVP_D4_PIN
+            int "DVP D4 Pin"
+            range 0 56
+            default 0
+
+        config EXAMPLE_DVP_D5_PIN
+            int "DVP D5 Pin"
+            range 0 56
+            default 45
+
+        config EXAMPLE_DVP_D6_PIN
+            int "DVP D6 Pin"
+            range 0 56
+            default 46
+
+        config EXAMPLE_DVP_D7_PIN
+            int "DVP D7 Pin"
+            range 0 56
+            default 47
+    endif
+
+    menu "Capture SD Card Configuration"
+
+        config EXAMPLE_CAPTURE_SDMMC_SLOT
+            int "SDMMC slot"
+            default 0
+            range 0 1
+            help
+                SDMMC host slot used by the microSD card.
+                On ESP32-P4 Function EV Board, ESP-Hosted Wi-Fi uses slot 1,
+                so the onboard microSD card should use slot 0.
+
+        choice EXAMPLE_CAPTURE_SDMMC_BUS_WIDTH
+            prompt "SD/MMC bus width"
+            default EXAMPLE_CAPTURE_SDMMC_BUS_WIDTH_1
+            help
+                Use 1-line mode for maximum compatibility. 4-line mode is
+                faster, but it requires D1-D3 to be wired and pulled up correctly.
+
+            config EXAMPLE_CAPTURE_SDMMC_BUS_WIDTH_1
+                bool "1-line mode"
+
+            config EXAMPLE_CAPTURE_SDMMC_BUS_WIDTH_4
+                bool "4-line mode"
+        endchoice
+
+        config EXAMPLE_CAPTURE_SDMMC_CLK_PIN
+            int "CLK pin GPIO number"
+            default 43 if IDF_TARGET_ESP32P4
+            default 1
+            range 0 56
+
+        config EXAMPLE_CAPTURE_SDMMC_CMD_PIN
+            int "CMD pin GPIO number"
+            default 44 if IDF_TARGET_ESP32P4
+            default 1
+            range 0 56
+
+        config EXAMPLE_CAPTURE_SDMMC_D0_PIN
+            int "D0 pin GPIO number"
+            default 39 if IDF_TARGET_ESP32P4
+            default 1
+            range 0 56
+
+        config EXAMPLE_CAPTURE_SD_PWR_CTRL_LDO_INTERNAL_IO
+            depends on SOC_SDMMC_IO_POWER_EXTERNAL
+            bool "SD power supply comes from internal LDO IO"
+            default y if IDF_TARGET_ESP32P4
+            help
+                Enable this when the SD card VDD is supplied by an ESP32-P4
+                internal LDO output. The ESP32-P4 Function EV Board microSD
+                slot uses this path.
+
+        config EXAMPLE_CAPTURE_SD_PWR_CTRL_LDO_IO_ID
+            depends on SOC_SDMMC_IO_POWER_EXTERNAL && EXAMPLE_CAPTURE_SD_PWR_CTRL_LDO_INTERNAL_IO
+            int "SD power LDO ID"
+            default 4 if IDF_TARGET_ESP32P4
+            range 0 4
+            help
+                Internal LDO channel used to power the SD card IO rail.
+
+        config EXAMPLE_CAPTURE_SD_CARD_POWER_RESET
+            depends on SOC_SDMMC_IO_POWER_EXTERNAL
+            bool "Reset SD card power before mount"
+            default y if IDF_TARGET_ESP32P4
+            help
+                Toggle the SD card power reset GPIO before probing the card.
+                This helps recover cards left in a bad state after a failed
+                initialization.
+
+        config EXAMPLE_CAPTURE_SD_CARD_POWER_RESET_PIN
+            depends on SOC_SDMMC_IO_POWER_EXTERNAL && EXAMPLE_CAPTURE_SD_CARD_POWER_RESET
+            int "SD card power reset GPIO"
+            default 45 if IDF_TARGET_ESP32P4
+            range 0 56
+
+        if EXAMPLE_CAPTURE_SDMMC_BUS_WIDTH_4
+
+            config EXAMPLE_CAPTURE_SDMMC_D1_PIN
+                int "D1 pin GPIO number"
+                default 40 if IDF_TARGET_ESP32P4
+                default 1
+                range 0 56
+
+            config EXAMPLE_CAPTURE_SDMMC_D2_PIN
+                int "D2 pin GPIO number"
+                default 41 if IDF_TARGET_ESP32P4
+                default 1
+                range 0 56
+
+            config EXAMPLE_CAPTURE_SDMMC_D3_PIN
+                int "D3 pin GPIO number"
+                default 42 if IDF_TARGET_ESP32P4
+                default 1
+                range 0 56
+
+        endif
+
+    endmenu
+
+endmenu

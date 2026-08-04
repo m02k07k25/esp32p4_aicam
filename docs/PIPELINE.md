@@ -1,107 +1,34 @@
-# 분류 파이프라인
+# 카메라·추론 파이프라인
 
-## 런타임 구조
+## 데이터 수집 경로
 
-런타임 코드는 크게 두 부분으로 나뉩니다.
+```text
+OV5647 800x800
+  -> V4L2 RGB565 스트림
+  -> 요청 시 완료된 오래된 버퍼 한 사이클 재큐잉
+  -> 요청 이후의 새 프레임 대기
+  -> JPEG 인코딩
+  -> HTTP 응답 또는 /sdcard/captures/IMGxxxxx.JPG 저장
+```
 
-- `main/simple_video_server_example.c`
-  - 카메라 초기화
-  - V4L2 버퍼 dequeue/requeue
-  - HTTP 엔드포인트 등록
-  - JPEG 응답 처리
-- `main/infer_bridge.cpp`
-  - 분류 모델 로드
-  - `224x224` 전처리
-  - 모델 추론
-  - top-1 후처리
-
-## 엔드포인트
-
-### `/pic`
-
-최신 프레임을 `capture.jpg`로 반환합니다.
-
-### `/record`
-
-현재 카메라 버퍼의 원본 바이트를 반환합니다.
-
-### `/classify.jpg`
-
-현재 `RGB565` 프레임을 분류하고, 원본 프레임을 JPEG로 반환합니다.
-
-응답 헤더는 다음과 같습니다.
-
-- `X-Class-Index`
-- `X-Class-Label`
-- `X-Class-Score`
-- `X-Inference-Time-Ms`
-- `X-Inference-Total-Ms`
+GPIO1은 내부 pull-up, active-low로 설정됩니다. GPIO1을 GND에 연결하면 HTTP `/capture`와 같은 저장 경로를 실행합니다.
 
 ## 추론 경로
 
-현재 추론 흐름은 다음과 같습니다.
-
 ```text
-OV5647 sensor
-  -> 800x800 frame
-  -> app requests RGB565 output
-  -> /classify.jpg dequeues one frame
-  -> infer_bridge preprocesses 800x800 RGB565 -> 224x224 tensor
-  -> MobileNetV2 0.35-width classifier runs with esp-dl
-  -> top-1 class is returned through HTTP headers
-  -> JPEG and classification metadata are chunked and sent to C6 over ESP-Hosted custom data
-  -> the original frame is JPEG-encoded and returned as classify.jpg
-  -> V4L2 buffer is queued back to the driver
+OV5647 800x800 RGB565
+  -> 요청 이후 새 프레임
+  -> 좌상/우상/좌하/우하/중앙 400x400 crop
+  -> 각 crop을 224x224로 resize
+  -> Keras MobileNetV2 방식 x / 127.5 - 1 전처리
+  -> ESP-DL 분류를 5회 실행
+  -> 가장 큰 human score와 threshold 0.72482645511627197 비교
+  -> JPEG + HTTP 결과 헤더
+  -> 선택적으로 JPEG/메타데이터를 C6에 비동기 SDIO 전송
 ```
 
-## 모델 설정
+라벨 순서는 `no_human`, `human`입니다. 가장 큰 human score가 threshold 이상일 때만 최종 클래스를 `human`으로 결정합니다.
 
-공유 런타임 설정은 `main/infer_config.h`에 있습니다.
+카메라와 공유 JPEG 출력 버퍼는 하나의 mutex로 보호합니다. `/pic`, `/record`, `/classify.jpg`가 동시에 호출되어도 프레임이 다른 요청에 의해 덮어써지지 않습니다.
 
-- 입력 너비: `224`
-- 입력 높이: `224`
-- 라벨 수: `2`
-- 전처리 방식: `resize`
-- 분류 응답 JPEG 품질: `60`
-
-기본 라벨은 다음과 같습니다.
-
-```text
-no_human
-human
-```
-
-이 순서는 `model/labels.txt`와 맞아야 합니다.
-
-## 빌드 연동
-
-분류 모델은 아래 파일에서 임베드됩니다.
-
-```text
-model/artifacts/espdl/classifier_224_p4.espdl
-```
-
-`main/CMakeLists.txt`는 이 파일이 없으면 빌드를 중단합니다. 링크 단계에서 늦게 실패하지 않고, 모델 파일 누락을 바로 확인하기 위한 처리입니다.
-
-## 모델 작업 공간
-
-`model/` 폴더는 ESP-IDF Python 환경과 분리된 별도 모델 작업 공간입니다.
-
-작업 흐름은 다음과 같습니다.
-
-```text
-train_model.py
-  -> artifacts/checkpoints/best.pt
-export_onnx.py
-  -> artifacts/onnx/classifier_224.onnx
-quantize_espdl.py
-  -> artifacts/espdl/classifier_224_p4.espdl
-```
-
-학습, ONNX 내보내기, 양자화, 펌웨어 전처리 경로는 모두 같은 `224x224` 리사이즈 정책과 ImageNet normalization 값을 사용합니다.
-
-## SDIO 전송
-
-`/classify.jpg` 처리 후 P4는 `main/sdio_frame_tx.c`를 통해 JPEG와 추론 결과를 C6로 전송합니다. JPEG는 ESP-Hosted custom data 한도를 넘을 수 있어서 `sdio_frame_chunk_header_t` 헤더가 붙은 여러 chunk로 나뉩니다.
-
-C6 쪽 수신 callback 예시는 [sdio_frame_transfer.md](sdio_frame_transfer.md)에 있습니다.
+추론은 `/classify.jpg` 요청에 의해 시작됩니다. 현재 펌웨어에는 10초 주기 등의 백그라운드 촬영·추론 타이머가 없습니다.

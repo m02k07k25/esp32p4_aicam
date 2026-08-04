@@ -1,124 +1,36 @@
-# SDIO 분류 프레임 전송
+# P4-C6 SDIO 전송과 검증
 
-P4는 `/classify.jpg` 요청을 처리한 뒤, JPEG와 추론 결과를 ESP-Hosted custom data로 C6에 전송합니다.
+SDIO는 P4와 C6 사이의 ESP-Hosted 통신 버스입니다. 이 기능에는 SD 카드가 필요하지 않습니다.
 
-## P4 송신
+## 구성
 
-송신은 `main/sdio_frame_tx.c`에서 처리합니다.
+| 칩 | 프로젝트 | 역할 | HTTP |
+| --- | --- | --- | --- |
+| ESP32-P4 | `firmware/p4_inference` | 촬영, 추론, JPEG 생성 및 custom data 송신 | Ethernet `:80` |
+| ESP32-C6 | `firmware/c6_hosted` | custom data 수신, JPEG 재조립 및 게시 | Wi-Fi `:8081` |
 
-- message ID: `SDIO_FRAME_MSG_ID`
-- chunk 헤더: `sdio_frame_chunk_header_t`
-- chunk 데이터 최대 크기: `SDIO_FRAME_CHUNK_DATA_MAX`
-- payload 구성: `sdio_frame_chunk_header_t` + JPEG chunk bytes
+두 프로젝트는 각각 동일한 `sdio_frame_protocol` 컴포넌트 사본을 포함하므로 독립적으로 빌드됩니다. 프로토콜을 바꿀 때는 P4와 C6의 헤더를 함께 수정해야 합니다.
 
-JPEG가 custom RPC payload 한도를 넘을 수 있으므로 여러 chunk로 나눠 보냅니다. C6는 `frame_id`, `chunk_index`, `chunk_count`, `chunk_offset`, `jpeg_size`를 사용해 JPEG를 다시 조립하면 됩니다.
+## 동작 순서
 
-## C6 수신 조건
+1. C6를 먼저 플래시하고 실제 Wi-Fi SSID/비밀번호로 부팅합니다.
+2. P4 추론 펌웨어를 플래시하고 Ethernet IP를 확인합니다.
+3. `http://<P4_ETH_IP>/classify.jpg`를 요청합니다.
+4. P4는 HTTP 결과를 반환하는 동시에 JPEG를 최대 7,600바이트 데이터 청크로 나눠 전송 큐에 복사합니다.
+5. C6는 magic, 버전, frame ID, 청크 순서·크기와 전체 JPEG 크기를 검증한 뒤 완성 프레임만 게시합니다.
+6. `http://<C6_WIFI_IP>:8081/` 또는 `/received.jpg`에서 같은 결과를 확인합니다.
 
-C6의 ESP-Hosted slave 펌웨어에도 아래 설정이 필요합니다.
+P4 전송 큐의 길이는 1이며 HTTP 처리와 분리된 worker가 송신합니다. 첫 실제 SDIO 전송 실패 후에는 재부팅 전까지 C6 전달을 중지하여 매 요청마다 5초 RPC timeout이 반복되는 일을 막습니다.
+
+## 주요 로그
+
+정상일 때는 다음 형태의 로그가 나타납니다.
 
 ```text
-CONFIG_ESP_HOSTED_ENABLE_PEER_DATA_TRANSFER=y
+P4: sdio_frame_tx: sent frame=... jpeg=... chunks=... class=... score=...
+C6: c6_frame_http: Published frame=... jpeg=... chunks=... class=... score=...
 ```
 
-## C6 수신 예시
+`Req_CustomRpc timeout`은 보통 C6에 구형/다른 Hosted 펌웨어가 올라가 있거나 C6 수신 handler가 아직 준비되지 않았다는 뜻입니다. `SDIO unavailable ... disabling frame forwarding until reboot` 이후에도 P4 Ethernet HTTP는 정상 동작해야 합니다.
 
-`idf.py create-project-from-example "espressif/esp_hosted:slave"`로 만든 C6 slave 프로젝트에 같은 프로토콜 상수와 헤더 구조를 추가한 뒤 callback을 등록합니다.
-
-```c
-#include <stdlib.h>
-#include <string.h>
-
-#include "esp_log.h"
-#include "esp_err.h"
-#include "slave_control.h"
-
-#define SDIO_FRAME_MSG_ID           0x504A5047u
-#define SDIO_FRAME_MAGIC            0x46544A50u
-#define SDIO_FRAME_VERSION          1
-#define SDIO_FRAME_CLASS_NAME_MAX   32
-
-typedef struct __attribute__((packed)) {
-    uint32_t magic;
-    uint16_t version;
-    uint16_t header_size;
-    uint32_t frame_id;
-    uint16_t chunk_index;
-    uint16_t chunk_count;
-    uint32_t flags;
-    uint32_t chunk_offset;
-    uint32_t chunk_size;
-    uint32_t jpeg_size;
-    int32_t class_id;
-    float score;
-    float inference_ms;
-    float total_ms;
-    char class_name[SDIO_FRAME_CLASS_NAME_MAX];
-} sdio_frame_chunk_header_t;
-
-static const char *TAG = "sdio_frame_rx";
-static uint32_t s_frame_id;
-static uint8_t *s_jpeg_buf;
-static uint32_t s_jpeg_size;
-static uint16_t s_chunks_received;
-static uint16_t s_chunk_count;
-
-static void frame_callback(uint32_t msg_id, const uint8_t *data, size_t data_len)
-{
-    if (data_len < sizeof(sdio_frame_chunk_header_t)) {
-        return;
-    }
-
-    const sdio_frame_chunk_header_t *header = (const sdio_frame_chunk_header_t *)data;
-    const uint8_t *chunk = data + header->header_size;
-
-    if (header->magic != SDIO_FRAME_MAGIC || header->version != SDIO_FRAME_VERSION) {
-        return;
-    }
-    if (header->header_size != sizeof(sdio_frame_chunk_header_t) ||
-        data_len < header->header_size + header->chunk_size) {
-        return;
-    }
-
-    if (s_jpeg_buf == NULL || s_frame_id != header->frame_id) {
-        free(s_jpeg_buf);
-        s_jpeg_buf = malloc(header->jpeg_size);
-        if (s_jpeg_buf == NULL) {
-            ESP_LOGE(TAG, "failed to allocate jpeg buffer");
-            return;
-        }
-        s_frame_id = header->frame_id;
-        s_jpeg_size = header->jpeg_size;
-        s_chunks_received = 0;
-        s_chunk_count = header->chunk_count;
-    }
-
-    if (header->chunk_offset + header->chunk_size > s_jpeg_size) {
-        return;
-    }
-
-    memcpy(s_jpeg_buf + header->chunk_offset, chunk, header->chunk_size);
-    s_chunks_received++;
-
-    if (s_chunks_received == s_chunk_count) {
-        ESP_LOGI(TAG,
-                 "frame=%lu jpeg=%lu B class=%ld label=%s score=%.4f infer=%.2f ms total=%.2f ms",
-                 (unsigned long)header->frame_id,
-                 (unsigned long)s_jpeg_size,
-                 (long)header->class_id,
-                 header->class_name,
-                 header->score,
-                 header->inference_ms,
-                 header->total_ms);
-
-        /* 여기서 s_jpeg_buf를 Wi-Fi HTTP 응답, WebSocket, BLE 전송 등에 사용합니다. */
-    }
-}
-
-esp_err_t app_frame_receiver_init(void)
-{
-    return esp_hosted_register_custom_callback(SDIO_FRAME_MSG_ID, frame_callback);
-}
-```
-
-`app_frame_receiver_init()`는 C6 slave 초기화가 끝난 뒤 호출해야 합니다.
+C6 페이지 접속이 안 되면 C6 로그에서 Wi-Fi IP와 `C6 HTTP server started on port 8081`을 모두 확인하세요. `192.168.4.1`은 P4 데이터 수집 SoftAP의 주소이며, C6 Hosted station IP와 같다고 가정하면 안 됩니다.
