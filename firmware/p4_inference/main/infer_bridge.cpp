@@ -150,6 +150,31 @@ public:
         m_model->run();
         return m_postprocessor->postprocess();
     }
+
+    esp_err_t resize_crop_rgb565(const dl::image::img_t &src,
+                                 const infer_result_t &result,
+                                 uint8_t *output_rgb565)
+    {
+        dl::image::img_t dst = {
+            .data = output_rgb565,
+            .width = INFER_INPUT_WIDTH,
+            .height = INFER_INPUT_HEIGHT,
+            .pix_type = dl::image::DL_IMAGE_PIX_TYPE_RGB565,
+        };
+        const std::vector<int> crop_area = {
+            result.crop_x,
+            result.crop_y,
+            result.crop_x + result.crop_width,
+            result.crop_y + result.crop_height,
+        };
+        return m_crop_export_transformer.set_src_img(src)
+            .set_dst_img(dst)
+            .set_src_img_crop_area(crop_area)
+            .transform();
+    }
+
+private:
+    dl::image::ImageTransformer m_crop_export_transformer;
 };
 
 static FixedLabelClassifier *s_classifier = nullptr;
@@ -218,6 +243,9 @@ extern "C" esp_err_t infer_bridge_process_rgb565(const uint8_t *rgb565_frame,
     if (rgb565_frame == nullptr || result == nullptr || width < 2 || height < 2) {
         return ESP_ERR_INVALID_ARG;
     }
+
+    memset(result, 0, sizeof(*result));
+    result->crop_region = UINT8_MAX;
 
     if (xSemaphoreTake(s_infer_lock, pdMS_TO_TICKS(kInferMutexTimeoutMs)) != pdTRUE) {
         return ESP_ERR_TIMEOUT;
@@ -313,6 +341,13 @@ extern "C" esp_err_t infer_bridge_process_rgb565(const uint8_t *rgb565_frame,
         result->class_name = g_infer_labels[result->class_id];
         result->score = human_detected ? best_human_score : best_no_human_score;
         result->inference_ms = (float)(esp_timer_get_time() - start_us) / 1000.0f;
+        result->crop_region = (uint8_t)best_region_index;
+        result->crop_x = (uint16_t)crop_regions[best_region_index][0];
+        result->crop_y = (uint16_t)crop_regions[best_region_index][1];
+        result->crop_width =
+            (uint16_t)(crop_regions[best_region_index][2] - crop_regions[best_region_index][0]);
+        result->crop_height =
+            (uint16_t)(crop_regions[best_region_index][3] - crop_regions[best_region_index][1]);
         ESP_LOGI(TAG,
                  "selected region=%s class=%s score=%.4f max_human=%.4f threshold=%.8f",
                  kCropRegionNames[best_region_index],
@@ -323,6 +358,41 @@ extern "C" esp_err_t infer_bridge_process_rgb565(const uint8_t *rgb565_frame,
     }
 
 cleanup:
+    xSemaphoreGive(s_infer_lock);
+    return ret;
+}
+
+extern "C" esp_err_t infer_bridge_resize_selected_crop_rgb565(const uint8_t *rgb565_frame,
+                                                               uint16_t width,
+                                                               uint16_t height,
+                                                               const infer_result_t *result,
+                                                               uint8_t *output_rgb565,
+                                                               size_t output_size)
+{
+    const size_t required_output_size =
+        (size_t)INFER_INPUT_WIDTH * INFER_INPUT_HEIGHT * sizeof(uint16_t);
+    if (s_classifier == nullptr || s_infer_lock == nullptr) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (rgb565_frame == nullptr || result == nullptr || output_rgb565 == nullptr ||
+        output_size < required_output_size || result->crop_region >= kCropRegionCount ||
+        result->crop_width == 0 || result->crop_height == 0 ||
+        (uint32_t)result->crop_x + result->crop_width > width ||
+        (uint32_t)result->crop_y + result->crop_height > height) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (xSemaphoreTake(s_infer_lock, pdMS_TO_TICKS(kInferMutexTimeoutMs)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    dl::image::img_t frame = {
+        .data = (void *)rgb565_frame,
+        .width = width,
+        .height = height,
+        .pix_type = dl::image::DL_IMAGE_PIX_TYPE_RGB565,
+    };
+    esp_err_t ret = s_classifier->resize_crop_rgb565(frame, *result, output_rgb565);
     xSemaphoreGive(s_infer_lock);
     return ret;
 }

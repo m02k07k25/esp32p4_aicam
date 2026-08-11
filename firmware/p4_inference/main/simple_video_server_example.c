@@ -3,21 +3,27 @@
  *
  * SPDX-License-Identifier: ESPRESSIF MIT
  */
+#include <inttypes.h>
 #include <string.h>
 #include <fcntl.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/param.h>
 #include <sys/errno.h>
+#include <sys/time.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "esp_event.h"
 #include "esp_err.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "nvs_flash.h"
 #include "esp_http_server.h"
 #include "sdkconfig.h"
+#if CONFIG_P4_INFERENCE_SNTP_ENABLE
+#include "esp_netif_sntp.h"
+#endif
 #include "protocol_examples_common.h"
 #include "linux/videodev2.h"
 #include "esp_video_init.h"
@@ -36,6 +42,16 @@
 #define CAM_DEV_PATH                 ESP_VIDEO_MIPI_CSI_DEVICE_NAME
 #define JPEG_ENC_QUALITY             (80)
 #define EXAMPLE_MIPI_SCCB_RETRY_DELAY_MS 1000
+#define AUTO_INFER_PERIOD_MS          30000
+#define AUTO_INFER_TASK_STACK_SIZE    8192
+#define AUTO_INFER_TASK_PRIORITY      5
+#define AUTO_JPEG_MAX_QUALITY         60
+#define AUTO_JPEG_MIN_QUALITY         20
+#define AUTO_JPEG_QUALITY_STEP        5
+#define AUTO_CROP_BUFFER_ALIGNMENT    64U
+#define AUTO_CROP_BUFFER_SIZE         (INFER_INPUT_WIDTH * INFER_INPUT_HEIGHT * 2U)
+_Static_assert(INFER_INPUT_WIDTH == 224 && INFER_INPUT_HEIGHT == 224,
+               "automatic SDIO human crop must remain exactly 224x224");
 #ifndef ARRAY_SIZE
 #define ARRAY_SIZE(arr) (sizeof(arr) / sizeof(arr[0]))
 #endif
@@ -73,6 +89,55 @@ typedef enum {
 
 const int s_queue_buf_type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 static const char *TAG = "example";
+
+#define APP_MIN_VALID_EPOCH_SECONDS 1704067200LL /* 2024-01-01 UTC */
+
+#if CONFIG_P4_INFERENCE_SNTP_ENABLE
+static volatile bool s_time_synchronized;
+
+static void app_sntp_sync_callback(struct timeval *tv)
+{
+    if (tv == NULL || (int64_t)tv->tv_sec < APP_MIN_VALID_EPOCH_SECONDS) {
+        return;
+    }
+
+    s_time_synchronized = true;
+    ESP_LOGI(TAG,
+             "SNTP synchronized: epoch_ms=%" PRIu64,
+             (uint64_t)tv->tv_sec * 1000ULL + (uint64_t)tv->tv_usec / 1000ULL);
+}
+
+static esp_err_t app_start_sntp(void)
+{
+    esp_sntp_config_t config =
+        ESP_NETIF_SNTP_DEFAULT_CONFIG(CONFIG_P4_INFERENCE_SNTP_SERVER);
+    config.sync_cb = app_sntp_sync_callback;
+
+    esp_err_t ret = esp_netif_sntp_init(&config);
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "SNTP started with server '%s'", CONFIG_P4_INFERENCE_SNTP_SERVER);
+    }
+    return ret;
+}
+#endif
+
+static uint64_t app_capture_epoch_ms(void)
+{
+#if CONFIG_P4_INFERENCE_SNTP_ENABLE
+    if (!s_time_synchronized) {
+        return 0;
+    }
+
+    struct timeval now;
+    if (gettimeofday(&now, NULL) != 0 ||
+        (int64_t)now.tv_sec < APP_MIN_VALID_EPOCH_SECONDS) {
+        return 0;
+    }
+    return (uint64_t)now.tv_sec * 1000ULL + (uint64_t)now.tv_usec / 1000ULL;
+#else
+    return 0;
+#endif
+}
 
 static void app_tune_task_wdt(void)
 {
@@ -432,6 +497,80 @@ static esp_err_t encode_frame_to_jpeg(web_cam_t *wc,
     return ESP_OK;
 }
 
+static esp_err_t encode_rgb565_to_jpeg(web_cam_t *wc,
+                                       uint8_t *rgb565,
+                                       uint32_t width,
+                                       uint32_t height,
+                                       uint8_t jpeg_quality,
+                                       uint8_t **jpeg_ptr,
+                                       size_t *jpeg_len)
+{
+    jpeg_encode_cfg_t jpeg_cfg = wc->jpeg_enc_config;
+    uint32_t jpeg_encoded_size = 0;
+
+    jpeg_cfg.src_type = JPEG_ENCODE_IN_FORMAT_RGB565;
+    jpeg_cfg.sub_sample = JPEG_DOWN_SAMPLING_YUV422;
+    jpeg_cfg.width = width;
+    jpeg_cfg.height = height;
+    jpeg_cfg.image_quality = jpeg_quality;
+
+    esp_err_t ret = jpeg_encoder_process(wc->jpeg_handle,
+                                         &jpeg_cfg,
+                                         rgb565,
+                                         width * height * 2U,
+                                         wc->jpeg_out_buf,
+                                         wc->jpeg_enc_output_buf_alloced_size,
+                                         &jpeg_encoded_size);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    *jpeg_ptr = wc->jpeg_out_buf;
+    *jpeg_len = jpeg_encoded_size;
+    return ESP_OK;
+}
+
+static esp_err_t encode_bounded_classification_crop_jpeg(web_cam_t *wc,
+                                                          uint8_t *crop_rgb565,
+                                                          uint8_t **jpeg_ptr,
+                                                          size_t *jpeg_len,
+                                                          uint8_t *selected_quality)
+{
+    for (int quality = AUTO_JPEG_MAX_QUALITY;
+         quality >= AUTO_JPEG_MIN_QUALITY;
+         quality -= AUTO_JPEG_QUALITY_STEP) {
+        esp_err_t ret = encode_rgb565_to_jpeg(wc,
+                                              crop_rgb565,
+                                              INFER_INPUT_WIDTH,
+                                              INFER_INPUT_HEIGHT,
+                                              (uint8_t)quality,
+                                              jpeg_ptr,
+                                              jpeg_len);
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG,
+                     "JPEG encode %dx%d q=%d failed: %s",
+                     INFER_INPUT_WIDTH,
+                     INFER_INPUT_HEIGHT,
+                     quality,
+                     esp_err_to_name(ret));
+            continue;
+        }
+
+        ESP_LOGD(TAG,
+                 "JPEG crop candidate %dx%d q=%d size=%u B",
+                 INFER_INPUT_WIDTH,
+                 INFER_INPUT_HEIGHT,
+                 quality,
+                 (unsigned int)*jpeg_len);
+        if (*jpeg_len <= SDIO_FRAME_MAX_JPEG_SIZE) {
+            *selected_quality = (uint8_t)quality;
+            return ESP_OK;
+        }
+    }
+
+    return ESP_ERR_INVALID_SIZE;
+}
+
 static esp_err_t classify_handler(httpd_req_t *req)
 {
     esp_err_t res = ESP_FAIL;
@@ -507,13 +646,6 @@ static esp_err_t classify_handler(httpd_req_t *req)
              total_ms,
              (unsigned int)jpeg_len);
 
-    esp_err_t sdio_ret =
-        sdio_frame_tx_submit_classification(jpeg_ptr, jpeg_len, &infer_result, total_ms);
-    if (sdio_ret != ESP_OK && sdio_ret != ESP_ERR_NOT_SUPPORTED &&
-        sdio_ret != ESP_ERR_INVALID_STATE) {
-        ESP_LOGW(TAG, "SDIO frame queue failed: %s", esp_err_to_name(sdio_ret));
-    }
-
     res = httpd_resp_send_chunk(req, (const char *)jpeg_ptr, jpeg_len);
     if (res != ESP_OK) {
         ESP_LOGE(TAG, "send classify chunk failed");
@@ -524,6 +656,173 @@ static esp_err_t classify_handler(httpd_req_t *req)
     res = httpd_resp_send_chunk(req, NULL, 0);
     xSemaphoreGive(wc->lock);
     return res;
+}
+
+static void run_periodic_inference(web_cam_t *wc, uint8_t *crop_rgb565)
+{
+    struct v4l2_buffer buf;
+    infer_result_t infer_result = {0};
+    uint64_t detected_at_ms = 0;
+    const int64_t start_us = esp_timer_get_time();
+
+    if (xSemaphoreTake(wc->lock, pdMS_TO_TICKS(10000)) != pdTRUE) {
+        ESP_LOGW(TAG, "30-second inference skipped: camera lock timeout");
+        return;
+    }
+
+    esp_err_t ret = dequeue_fresh_video_frame_locked(wc, &buf);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "30-second inference failed to capture a fresh frame");
+        xSemaphoreGive(wc->lock);
+        return;
+    }
+    /* This fresh buffer was produced after the dequeue request. Timestamp it
+     * before inference so Mesh congestion and encoding time cannot shift the
+     * event's capture time. Zero explicitly means SNTP is not synchronized. */
+    detected_at_ms = app_capture_epoch_ms();
+
+    const size_t required_rgb565_size = (size_t)wc->width * wc->height * 2U;
+    if (wc->pixel_format != EXAMPLE_VIDEO_FMT_RGB565 ||
+        buf.bytesused < required_rgb565_size) {
+        ESP_LOGW(TAG,
+                 "30-second inference got invalid RGB565 frame: format=%08" PRIx32
+                 " bytes=%u expected=%u",
+                 wc->pixel_format,
+                 (unsigned int)buf.bytesused,
+                 (unsigned int)required_rgb565_size);
+        ret = ESP_ERR_INVALID_SIZE;
+        goto requeue_frame;
+    }
+
+    ret = infer_bridge_process_rgb565(
+        wc->buffer[buf.index], wc->width, wc->height, &infer_result);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "30-second inference failed: %s", esp_err_to_name(ret));
+        goto requeue_frame;
+    }
+
+    ESP_LOGI(TAG,
+             "30-second inference: class=%d (%s) score=%.4f inference=%.2f ms",
+             infer_result.class_id,
+             infer_result.class_name,
+             infer_result.score,
+             infer_result.inference_ms);
+
+    if (infer_result.class_id != INFER_HUMAN_CLASS_ID) {
+        goto requeue_frame;
+    }
+    if (!sdio_frame_tx_remote_ready()) {
+        ESP_LOGI(TAG, "human detected, but C6 is not READY; crop/JPEG work skipped");
+        goto requeue_frame;
+    }
+    if (crop_rgb565 == NULL) {
+        ESP_LOGW(TAG, "human detected and C6 READY, but the 224x224 crop buffer is unavailable");
+        goto requeue_frame;
+    }
+
+    ret = infer_bridge_resize_selected_crop_rgb565(wc->buffer[buf.index],
+                                                    wc->width,
+                                                    wc->height,
+                                                    &infer_result,
+                                                    crop_rgb565,
+                                                    AUTO_CROP_BUFFER_SIZE);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG,
+                 "failed to export selected human crop region=%u x=%u y=%u w=%u h=%u: %s",
+                 infer_result.crop_region,
+                 infer_result.crop_x,
+                 infer_result.crop_y,
+                 infer_result.crop_width,
+                 infer_result.crop_height,
+                 esp_err_to_name(ret));
+        goto requeue_frame;
+    }
+
+    uint8_t *jpeg_ptr = NULL;
+    size_t jpeg_len = 0;
+    uint8_t selected_quality = 0;
+    ret = encode_bounded_classification_crop_jpeg(wc,
+                                                  crop_rgb565,
+                                                  &jpeg_ptr,
+                                                  &jpeg_len,
+                                                  &selected_quality);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG,
+                 "no 224x224 crop JPEG fit within %u B after q=%d..%d ladder",
+                 SDIO_FRAME_MAX_JPEG_SIZE,
+                 AUTO_JPEG_MAX_QUALITY,
+                 AUTO_JPEG_MIN_QUALITY);
+        goto requeue_frame;
+    }
+
+    const float total_ms = (float)(esp_timer_get_time() - start_us) / 1000.0f;
+    ret = sdio_frame_tx_submit_event(jpeg_ptr, jpeg_len, detected_at_ms);
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG,
+                 "queued human crop region=%u src=[%u,%u,%u,%u] JPEG=%dx%d"
+                 " q=%u size=%u B detected_at_ms=%" PRIu64 " total=%.2f ms",
+                 infer_result.crop_region,
+                 infer_result.crop_x,
+                 infer_result.crop_y,
+                 infer_result.crop_width,
+                 infer_result.crop_height,
+                 INFER_INPUT_WIDTH,
+                 INFER_INPUT_HEIGHT,
+                 selected_quality,
+                 (unsigned int)jpeg_len,
+                 detected_at_ms,
+                 total_ms);
+    } else if (ret == ESP_ERR_INVALID_STATE) {
+        ESP_LOGI(TAG, "C6 READY changed while encoding; automatic JPEG was not queued");
+    } else {
+        ESP_LOGW(TAG, "automatic SDIO frame queue failed: %s", esp_err_to_name(ret));
+    }
+
+requeue_frame:
+    if (ioctl(wc->fd, VIDIOC_QBUF, &buf) != 0) {
+        ESP_LOGE(TAG, "failed to requeue automatic inference frame");
+    }
+    xSemaphoreGive(wc->lock);
+}
+
+static void periodic_inference_task(void *arg)
+{
+    web_cam_t *wc = (web_cam_t *)arg;
+    uint8_t *crop_rgb565 = NULL;
+    TickType_t last_wake = xTaskGetTickCount();
+
+    while (true) {
+        vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(AUTO_INFER_PERIOD_MS));
+
+        if (crop_rgb565 == NULL) {
+            crop_rgb565 = heap_caps_aligned_calloc(AUTO_CROP_BUFFER_ALIGNMENT,
+                                                   1,
+                                                   AUTO_CROP_BUFFER_SIZE,
+                                                   MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA);
+            if (crop_rgb565 == NULL) {
+                ESP_LOGW(TAG, "failed to allocate %u-byte 224x224 RGB565 crop buffer; will retry",
+                         AUTO_CROP_BUFFER_SIZE);
+            }
+        }
+
+        run_periodic_inference(wc, crop_rgb565);
+    }
+}
+
+static esp_err_t start_periodic_inference(web_cam_t *wc)
+{
+    if (wc == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (xTaskCreate(periodic_inference_task,
+                    "periodic_infer",
+                    AUTO_INFER_TASK_STACK_SIZE,
+                    wc,
+                    AUTO_INFER_TASK_PRIORITY,
+                    NULL) != pdPASS) {
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
 }
 
 static esp_err_t new_web_cam(int cam_fd, web_cam_t **ret_wc)
@@ -704,7 +1003,7 @@ static esp_err_t http_server_init(int index, web_cam_t *web_cam)
  *     - ESP_OK   Success
  *     - Others error
  */
-static esp_err_t start_cam_web_server(int index, int cam_fd)
+static esp_err_t start_cam_web_server(int index, int cam_fd, web_cam_t **ret_web_cam)
 {
     web_cam_t *web_cam;
     esp_err_t ret = new_web_cam(cam_fd, &web_cam);
@@ -712,7 +1011,11 @@ static esp_err_t start_cam_web_server(int index, int cam_fd)
         ESP_LOGE(TAG, "Failed to new web cam");
         return ret;
     }
-    return http_server_init(index, web_cam);
+    ret = http_server_init(index, web_cam);
+    if (ret == ESP_OK) {
+        *ret_web_cam = web_cam;
+    }
+    return ret;
 }
 
 static void initialise_mdns(void)
@@ -761,6 +1064,17 @@ void app_main(void)
      */
     ESP_ERROR_CHECK(example_connect());
 
+#if CONFIG_P4_INFERENCE_SNTP_ENABLE
+    esp_err_t sntp_ret = app_start_sntp();
+    if (sntp_ret != ESP_OK) {
+        ESP_LOGW(TAG,
+                 "SNTP initialization failed: %s; detection timestamps stay zero until reboot",
+                 esp_err_to_name(sntp_ret));
+    }
+#else
+    ESP_LOGW(TAG, "SNTP disabled; detection timestamps are sent as zero");
+#endif
+
     int video_cam_fd = app_video_open(CAM_DEV_PATH, EXAMPLE_VIDEO_FMT_RGB565);
     if (video_cam_fd < 0) {
         ESP_LOGE(TAG, "video cam open failed");
@@ -772,6 +1086,9 @@ void app_main(void)
     if (sdio_ret != ESP_OK && sdio_ret != ESP_ERR_NOT_SUPPORTED) {
         ESP_LOGW(TAG, "Failed to start optional SDIO frame sender: %s", esp_err_to_name(sdio_ret));
     }
-    ESP_ERROR_CHECK(start_cam_web_server(index, video_cam_fd));
+    web_cam_t *web_cam = NULL;
+    ESP_ERROR_CHECK(start_cam_web_server(index, video_cam_fd, &web_cam));
+    ESP_ERROR_CHECK(start_periodic_inference(web_cam));
+    ESP_LOGI(TAG, "automatic inference scheduled every %u ms", AUTO_INFER_PERIOD_MS);
     ESP_LOGI(TAG, "Example Start");
 }

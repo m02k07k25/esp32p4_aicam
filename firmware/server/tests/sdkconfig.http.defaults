@@ -1,0 +1,6 @@
+# Compile-only overlay used to keep the optional Wi-Fi/SNTP/HTTP path healthy.
+# Do not flash these placeholder credentials.
+CONFIG_SERVER_SERIAL_IMAGE_ENABLE=n
+CONFIG_SERVER_HTTP_ENABLE=y
+CONFIG_SERVER_WIFI_SSID="compile-only"
+CONFIG_SERVER_WIFI_PASSWORD=""

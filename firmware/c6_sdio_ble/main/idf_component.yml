@@ -1,0 +1,5 @@
+targets:
+  - esp32c6
+
+dependencies:
+  idf: ">=5.5,<5.6"

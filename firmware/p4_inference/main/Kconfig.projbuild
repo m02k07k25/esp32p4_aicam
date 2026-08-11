@@ -1,5 +1,21 @@
 menu "Example Configuration"
 
+    config P4_INFERENCE_SNTP_ENABLE
+        bool "Synchronize detection timestamps with SNTP"
+        default y
+        help
+            Start the ESP-NETIF SNTP client after Ethernet is connected. Human
+            image events carry Unix epoch milliseconds after the first
+            successful synchronization, or zero while time is not synchronized.
+
+    config P4_INFERENCE_SNTP_SERVER
+        string "SNTP server"
+        default "pool.ntp.org"
+        depends on P4_INFERENCE_SNTP_ENABLE
+        help
+            Host name or numeric address of the SNTP server used for absolute
+            human detection timestamps.
+
     config EXAMPLE_ENABLE_MIPI_CSI_CAM_SENSOR
         bool "Enable MIPI CSI Camera Sensor"
         default y

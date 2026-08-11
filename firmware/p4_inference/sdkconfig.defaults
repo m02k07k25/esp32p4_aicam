@@ -50,7 +50,12 @@ CONFIG_WIFI_RMT_RX_BA_WIN=32
 # CONFIG_WIFI_RMT_ENTERPRISE_SUPPORT is not set
 # CONFIG_ESP_WIFI_REMOTE_EAP_ENABLED is not set
 
-# P4 inference exposes its own HTTP server over Ethernet. The optional custom
-# SDIO sender mirrors each classification result to the paired C6 firmware.
+# P4 inference exposes its own HTTP server over Ethernet. The custom SDIO
+# sender is driven only by the 30-second human monitor and paired c6_sdio_ble.
 # CONFIG_EXAMPLE_CONNECT_WIFI is not set
 CONFIG_EXAMPLE_CONNECT_ETHERNET=y
+
+# Absolute capture timestamps for SDIO image events. Set the server to a LAN
+# NTP address for deployments without Internet access.
+CONFIG_P4_INFERENCE_SNTP_ENABLE=y
+CONFIG_P4_INFERENCE_SNTP_SERVER="pool.ntp.org"

@@ -1,0 +1,67 @@
+menu "Mesh image server"
+
+    config SERVER_MAX_NODES
+        int "Maximum provisioned C6 nodes"
+        range 1 100
+        default 10
+        help
+            Runtime bookkeeping capacity for newly provisioned C6 sources.
+            ESP-BLE-Mesh has its own matching provisioning-node limit.
+
+    config SERVER_FRAME_TIMEOUT_MS
+        int "Inactive frame timeout (milliseconds)"
+        range 5000 120000
+        default 30000
+        help
+            Abort a frame when no valid OPEN, DATA, or END for this duration.
+
+    config SERVER_TEST_DROP_CHUNK_INDEX
+        int "One-shot DATA drop index for NACK testing"
+        range -1 82
+        default -1
+        help
+            -1 disables fault injection. Any other value drops that DATA
+            chunk once after boot while an active matching frame exists, so
+            the following END must produce a bitmap NACK.
+
+    config SERVER_HTTP_ENABLE
+        bool "Wi-Fi/SNTP latest-image HTTP adapter"
+        depends on SOC_WIFI_SUPPORTED && !SERVER_SERIAL_IMAGE_ENABLE
+        default n
+        help
+            Optional adapter for Wi-Fi-capable targets. The Mesh core and
+            public callback API do not depend on Wi-Fi; ESP32-H2 excludes this
+            source entirely.
+
+    if SERVER_HTTP_ENABLE
+
+        config SERVER_WIFI_SSID
+            string "Wi-Fi SSID"
+            default ""
+
+        config SERVER_WIFI_PASSWORD
+            string "Wi-Fi password"
+            default ""
+
+        config SERVER_SNTP_SERVER
+            string "SNTP server"
+            default "pool.ntp.org"
+
+        config SERVER_HTTP_PORT
+            int "HTTP port"
+            range 1 65535
+            default 80
+
+    endif
+
+    config SERVER_SERIAL_IMAGE_ENABLE
+        bool "Framed JPEG records on the console stream"
+        default y
+        help
+            Copy each completed Mesh JPEG into a fixed static queue and
+            transmit it atomically on the same stdout stream as text event
+            logs. Use the supplied PC receiver instead of idf.py monitor.
+            This option is mutually exclusive with the Wi-Fi/SNTP/HTTP
+            adapter. A 921600-baud console is recommended.
+
+endmenu
