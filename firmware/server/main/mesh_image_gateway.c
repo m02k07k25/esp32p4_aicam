@@ -39,6 +39,12 @@ extern void ble_store_config_init(void);
 
 #define SERVER_UNICAST_ADDR       UINT16_C(0x0001)
 #define FIRST_NODE_ADDR           UINT16_C(0x0002)
+#define DEVICE_UUID_ID_OFFSET     8U
+#define DEVICE_UUID_BT_ADDR_OFFSET 2U
+#define DEVICE_UUID_BT_ADDR_BYTES 6U
+#define DEVICE_UUID_RESERVED_OFFSET 10U
+#define DEVICE_ID_MIN             UINT16_C(1)
+#define DEVICE_ID_MAX             UINT16_C(0x7FFE)
 #define PRIMARY_NET_IDX           ESP_BLE_MESH_KEY_PRIMARY
 #define IMAGE_APP_IDX             UINT16_C(0x0000)
 #define CONFIG_TIMEOUT_MS         4000
@@ -55,6 +61,7 @@ extern void ble_store_config_init(void);
 typedef struct {
     bool used;
     uint8_t uuid[16];
+    uint16_t device_id;
     uint16_t unicast;
     uint8_t element_count;
     uint32_t pending_opcode;
@@ -63,7 +70,10 @@ typedef struct {
 
 static uint8_t s_prov_uuid[16] = {0x47U, 0x57U};
 static uint8_t s_app_key[16];
-static bool s_provisioning_enabled;
+static bool s_gateway_ready;
+static bool s_provisioning_active;
+static uint16_t s_pending_device_id;
+static uint8_t s_pending_device_uuid[16];
 static bool s_initialized;
 #if CONFIG_SERVER_TEST_DROP_CHUNK_INDEX >= 0
 static bool s_test_drop_done;
@@ -101,6 +111,8 @@ static esp_ble_mesh_model_op_t s_vendor_ops[] = {
                           sizeof(ble_mesh_image_data_header_t) + 1U),
     ESP_BLE_MESH_MODEL_OP(IMAGE_OPCODE(BLE_MESH_IMAGE_OP_END),
                           sizeof(ble_mesh_image_frame_t)),
+    ESP_BLE_MESH_MODEL_OP(IMAGE_OPCODE(BLE_MESH_IMAGE_OP_TIME_REQUEST),
+                          sizeof(ble_mesh_time_request_t)),
     ESP_BLE_MESH_MODEL_OP_END,
 };
 
@@ -134,6 +146,8 @@ static esp_ble_mesh_prov_t s_provision = {
 };
 
 static configured_node_t s_nodes[CONFIG_SERVER_MAX_NODES];
+_Static_assert(CONFIG_SERVER_MAX_NODES <= CONFIG_BLE_MESH_MAX_PROV_NODES,
+               "server runtime node capacity exceeds Mesh node capacity");
 static image_reassembly_t s_reassembly;
 static SemaphoreHandle_t s_reassembly_mutex;
 static bool s_idle_work_reserved;
@@ -145,6 +159,64 @@ static mesh_image_gateway_time_provider_t s_time_provider;
 static void *s_time_provider_ctx;
 
 static esp_err_t send_node_config(configured_node_t *node, uint32_t opcode);
+
+static uint16_t device_id_from_uuid(const uint8_t uuid[16])
+{
+    if (uuid == NULL || uuid[0] != 0x32U || uuid[1] != 0x10U) {
+        return 0U;
+    }
+    return (uint16_t)uuid[DEVICE_UUID_ID_OFFSET] |
+           ((uint16_t)uuid[DEVICE_UUID_ID_OFFSET + 1U] << 8);
+}
+
+static bool device_uuid_layout_valid(const uint8_t uuid[16])
+{
+    if (uuid == NULL) {
+        return false;
+    }
+    const uint16_t device_id = device_id_from_uuid(uuid);
+    if (device_id < DEVICE_ID_MIN || device_id > DEVICE_ID_MAX) {
+        return false;
+    }
+
+    bool address_is_nonzero = false;
+    for (size_t i = 0; i < DEVICE_UUID_BT_ADDR_BYTES; ++i) {
+        address_is_nonzero |= uuid[DEVICE_UUID_BT_ADDR_OFFSET + i] != 0U;
+    }
+    if (!address_is_nonzero) {
+        return false;
+    }
+
+    for (size_t i = DEVICE_UUID_RESERVED_OFFSET; i < 16U; ++i) {
+        if (uuid[i] != 0U) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool device_uuid_has_same_bt_address(const uint8_t left[16],
+                                            const uint8_t right[16])
+{
+    return left != NULL && right != NULL &&
+           memcmp(left + DEVICE_UUID_BT_ADDR_OFFSET,
+                  right + DEVICE_UUID_BT_ADDR_OFFSET,
+                  DEVICE_UUID_BT_ADDR_BYTES) == 0;
+}
+
+static uint16_t device_addr_from_id(uint16_t device_id)
+{
+    return device_id >= DEVICE_ID_MIN && device_id <= DEVICE_ID_MAX ?
+           (uint16_t)(SERVER_UNICAST_ADDR + device_id) : 0U;
+}
+
+uint16_t mesh_image_gateway_device_id_from_addr(uint16_t source_addr)
+{
+    if (source_addr <= SERVER_UNICAST_ADDR || source_addr > 0x7FFFU) {
+        return 0U;
+    }
+    return (uint16_t)(source_addr - SERVER_UNICAST_ADDR);
+}
 
 #if defined(CONFIG_BT_NIMBLE_ENABLED)
 static SemaphoreHandle_t s_bt_sync_sem;
@@ -224,11 +296,109 @@ static configured_node_t *find_node(uint16_t unicast)
     return NULL;
 }
 
+static configured_node_t *find_node_by_uuid(const uint8_t uuid[16])
+{
+    if (uuid == NULL) {
+        return NULL;
+    }
+    for (size_t i = 0; i < ARRAY_SIZE(s_nodes); ++i) {
+        if (s_nodes[i].used && memcmp(s_nodes[i].uuid, uuid, 16U) == 0) {
+            return &s_nodes[i];
+        }
+    }
+    return NULL;
+}
+
+static configured_node_t *find_node_by_bt_address(const uint8_t uuid[16])
+{
+    if (uuid == NULL) {
+        return NULL;
+    }
+    for (size_t i = 0; i < ARRAY_SIZE(s_nodes); ++i) {
+        if (s_nodes[i].used &&
+            device_uuid_has_same_bt_address(s_nodes[i].uuid, uuid)) {
+            return &s_nodes[i];
+        }
+    }
+    return NULL;
+}
+
+static const esp_ble_mesh_node_t *find_mesh_node_by_bt_address(
+    const uint8_t uuid[16])
+{
+    const esp_ble_mesh_node_t **table =
+        esp_ble_mesh_provisioner_get_node_table_entry();
+    if (uuid == NULL || table == NULL) {
+        return NULL;
+    }
+    for (size_t i = 0; i < CONFIG_BLE_MESH_MAX_PROV_NODES; ++i) {
+        if (table[i] != NULL &&
+            device_uuid_has_same_bt_address(table[i]->dev_uuid, uuid)) {
+            return table[i];
+        }
+    }
+    return NULL;
+}
+
+static const esp_ble_mesh_node_t *find_mesh_node_by_device_id(
+    uint16_t device_id)
+{
+    const esp_ble_mesh_node_t **table =
+        esp_ble_mesh_provisioner_get_node_table_entry();
+    if (table == NULL) {
+        return NULL;
+    }
+    for (size_t i = 0; i < CONFIG_BLE_MESH_MAX_PROV_NODES; ++i) {
+        if (table[i] != NULL &&
+            device_id_from_uuid(table[i]->dev_uuid) == device_id) {
+            return table[i];
+        }
+    }
+    return NULL;
+}
+
+static bool has_free_runtime_node_slot(void)
+{
+    for (size_t i = 0; i < ARRAY_SIZE(s_nodes); ++i) {
+        if (!s_nodes[i].used) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static configured_node_t *store_node(const uint8_t uuid[16],
                                      uint16_t unicast,
                                      uint8_t element_count)
 {
+    const uint16_t device_id = device_id_from_uuid(uuid);
+    const uint16_t expected_addr = device_addr_from_id(device_id);
+    if (!device_uuid_layout_valid(uuid) || expected_addr == 0U ||
+        unicast != expected_addr ||
+        element_count != 1U) {
+        ESP_LOGE(TAG,
+                 "invalid C6 identity id=%u addr=0x%04x expected=0x%04x "
+                 "elements=%u; erase server Mesh NVS and reset every "
+                 "registered C6 before reprovisioning",
+                 device_id, unicast, expected_addr, element_count);
+        return NULL;
+    }
+
     configured_node_t *entry = find_node(unicast);
+    configured_node_t *uuid_entry = find_node_by_uuid(uuid);
+    configured_node_t *bt_entry = find_node_by_bt_address(uuid);
+    if ((entry != NULL && memcmp(entry->uuid, uuid, 16U) != 0) ||
+        (uuid_entry != NULL && uuid_entry->unicast != unicast) ||
+        (bt_entry != NULL && bt_entry->device_id != device_id)) {
+        ESP_LOGE(TAG,
+                 "C6 ID/address collision id=%u addr=0x%04x; "
+                 "each device must use a unique C6_DEVICE_ID",
+                 device_id, unicast);
+        return NULL;
+    }
+    if (entry == NULL) {
+        entry = uuid_entry;
+    }
     if (entry == NULL) {
         for (size_t i = 0; i < ARRAY_SIZE(s_nodes); ++i) {
             if (!s_nodes[i].used) {
@@ -243,6 +413,7 @@ static configured_node_t *store_node(const uint8_t uuid[16],
 
     *entry = (configured_node_t) {
         .used = true,
+        .device_id = device_id,
         .unicast = unicast,
         .element_count = element_count,
     };
@@ -266,12 +437,15 @@ static void restore_provisioned_nodes(void)
         configured_node_t *node = store_node(
             stored->dev_uuid, stored->unicast_addr, stored->element_num);
         if (node == NULL) {
-            ESP_LOGE(TAG, "runtime node table full while restoring 0x%04x",
+            ESP_LOGE(TAG,
+                     "could not restore C6 identity at 0x%04x; "
+                     "erase server Mesh NVS and reset every registered C6",
                      stored->unicast_addr);
             continue;
         }
-        ESP_LOGI(TAG, "restored C6 addr=0x%04x for idempotent config",
-                 node->unicast);
+        ESP_LOGI(TAG,
+                 "restored C6 id=%u addr=0x%04x for idempotent config",
+                 node->device_id, node->unicast);
     }
 }
 
@@ -371,20 +545,16 @@ static esp_err_t load_or_create_app_key(void)
     return err;
 }
 
-static esp_err_t enable_provisioning(void)
+static void mark_gateway_ready(void)
 {
-    if (s_provisioning_enabled) {
-        return ESP_OK;
+    if (s_gateway_ready) {
+        return;
     }
+
+    s_gateway_ready = true;
     resume_node_configuration();
-    esp_err_t err = esp_ble_mesh_provisioner_prov_enable(
-        (esp_ble_mesh_prov_bearer_t)(ESP_BLE_MESH_PROV_ADV |
-                                     ESP_BLE_MESH_PROV_GATT));
-    if (err == ESP_OK) {
-        s_provisioning_enabled = true;
-        ESP_LOGI(TAG, "auto provisioning enabled for UUID prefix 32 10");
-    }
-    return err;
+    ESP_LOGI(TAG, "Gateway AppKey ready; auto provisioning active for "
+                  "UUID prefix 32 10");
 }
 
 static esp_err_t bind_local_gateway_model(void)
@@ -412,44 +582,214 @@ static void provisioning_callback(esp_ble_mesh_prov_cb_event_t event,
     }
 
     switch (event) {
+    case ESP_BLE_MESH_PROVISIONER_PROV_ENABLE_COMP_EVT: {
+        if (param->provisioner_prov_enable_comp.err_code != ESP_OK) {
+            ESP_LOGE(TAG, "Provisioner enable failed: %d",
+                     param->provisioner_prov_enable_comp.err_code);
+            break;
+        }
+
+        /* ESP-IDF creates or restores the Provisioner's Primary NetKey as
+         * part of PROV_ENABLE.  Local AppKey operations before this event
+         * fail asynchronously with -ENODEV (Invalid NetKeyIndex 0x0000).
+         * Keep all local AppKey setup behind this completion event. */
+        if (local_gateway_model_is_bound()) {
+            const uint8_t *existing =
+                esp_ble_mesh_provisioner_get_local_app_key(
+                    PRIMARY_NET_IDX, IMAGE_APP_IDX);
+            if (existing == NULL) {
+                ESP_LOGE(TAG, "Gateway model is bound but AppKey is missing; "
+                              "erase the server Mesh NVS and reset all nodes");
+                break;
+            }
+            memcpy(s_app_key, existing, sizeof(s_app_key));
+            mark_gateway_ready();
+            break;
+        }
+
+        esp_err_t err = load_or_create_app_key();
+        if (err == ESP_OK) {
+            /* This is idempotent when an earlier boot stored the same key but
+             * stopped before binding the local model. */
+            err = esp_ble_mesh_provisioner_add_local_app_key(
+                s_app_key, PRIMARY_NET_IDX, IMAGE_APP_IDX);
+        }
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "local AppKey setup enqueue failed: %s",
+                     esp_err_to_name(err));
+        }
+        break;
+    }
     case ESP_BLE_MESH_PROVISIONER_RECV_UNPROV_ADV_PKT_EVT: {
+        /* Provisioner scanning starts before local AppKey add/bind completes.
+         * A device keeps advertising, so ignoring it during this short window
+         * is safe and prevents provisioning a node we cannot configure. */
+        if (!s_gateway_ready) {
+            break;
+        }
         const uint8_t *uuid =
             param->provisioner_recv_unprov_adv_pkt.dev_uuid;
         if (uuid[0] != 0x32U || uuid[1] != 0x10U) {
             break;
         }
-        esp_ble_mesh_unprov_dev_add_t device = {0};
-        memcpy(device.addr, param->provisioner_recv_unprov_adv_pkt.addr,
-               BD_ADDR_LEN);
-        device.addr_type =
-            param->provisioner_recv_unprov_adv_pkt.addr_type;
-        memcpy(device.uuid, uuid, 16U);
-        device.oob_info =
-            param->provisioner_recv_unprov_adv_pkt.oob_info;
-        device.bearer = param->provisioner_recv_unprov_adv_pkt.bearer;
-        esp_err_t err = esp_ble_mesh_provisioner_add_unprov_dev(
-            &device,
-            (esp_ble_mesh_dev_add_flag_t)(ADD_DEV_RM_AFTER_PROV_FLAG |
-                                          ADD_DEV_START_PROV_NOW_FLAG |
-                                          ADD_DEV_FLUSHABLE_DEV_FLAG));
+        const uint16_t device_id = device_id_from_uuid(uuid);
+        const uint16_t target_addr = device_addr_from_id(device_id);
+        if (!device_uuid_layout_valid(uuid) || target_addr == 0U) {
+            ESP_LOGE(TAG,
+                     "reject C6 with invalid UUID layout/device ID %u; "
+                     "set C6_DEVICE_ID to 1..%u and use current firmware",
+                     device_id, DEVICE_ID_MAX);
+            break;
+        }
+
+        esp_ble_mesh_node_t *mesh_address_owner =
+            esp_ble_mesh_provisioner_get_node_with_addr(target_addr);
+        const esp_ble_mesh_node_t *mesh_bt_owner =
+            find_mesh_node_by_bt_address(uuid);
+        const esp_ble_mesh_node_t *mesh_id_owner =
+            find_mesh_node_by_device_id(device_id);
+        configured_node_t *address_owner = find_node(target_addr);
+        configured_node_t *uuid_owner = find_node_by_uuid(uuid);
+        configured_node_t *bt_owner = find_node_by_bt_address(uuid);
+        if (mesh_address_owner != NULL || mesh_bt_owner != NULL ||
+            mesh_id_owner != NULL || address_owner != NULL ||
+            uuid_owner != NULL || bt_owner != NULL) {
+            if (address_owner != NULL &&
+                memcmp(address_owner->uuid, uuid, 16U) != 0) {
+                ESP_LOGE(TAG,
+                         "reject duplicate C6 device ID %u: addr=0x%04x "
+                         "already belongs to another UUID",
+                         device_id, target_addr);
+            } else if (mesh_address_owner != NULL &&
+                       memcmp(mesh_address_owner->dev_uuid, uuid, 16U) != 0) {
+                ESP_LOGE(TAG,
+                         "reject C6 id=%u: Mesh address 0x%04x overlaps a "
+                         "persisted node; assign this new C6 an unused "
+                         "C6_DEVICE_ID (replacing the old node requires a "
+                         "full Mesh reset)",
+                         device_id, target_addr);
+            } else if (bt_owner != NULL &&
+                       bt_owner->device_id != device_id) {
+                ESP_LOGE(TAG,
+                         "reject C6 Bluetooth identity already registered as "
+                         "id=%u addr=0x%04x; erase server Mesh NVS and reset "
+                         "every registered C6 before changing C6_DEVICE_ID",
+                         bt_owner->device_id, bt_owner->unicast);
+            } else if (mesh_bt_owner != NULL &&
+                       memcmp(mesh_bt_owner->dev_uuid, uuid, 16U) != 0) {
+                ESP_LOGE(TAG,
+                         "reject C6 Bluetooth identity retained in Mesh NVS "
+                         "at 0x%04x; erase server Mesh NVS and reset every "
+                         "registered C6 before changing C6_DEVICE_ID",
+                         mesh_bt_owner->unicast_addr);
+            } else if (mesh_bt_owner != NULL &&
+                       mesh_bt_owner->unicast_addr != target_addr) {
+                ESP_LOGE(TAG,
+                         "reject C6 UUID retained at stale addr=0x%04x "
+                         "instead of id=%u addr=0x%04x; erase server Mesh "
+                         "NVS and reset every registered C6",
+                         mesh_bt_owner->unicast_addr, device_id, target_addr);
+            } else if (mesh_id_owner != NULL &&
+                       memcmp(mesh_id_owner->dev_uuid, uuid, 16U) != 0) {
+                ESP_LOGE(TAG,
+                         "reject duplicate C6 device ID %u retained at "
+                         "Mesh addr=0x%04x; IDs must be unique",
+                         device_id, mesh_id_owner->unicast_addr);
+            } else {
+                ESP_LOGW(TAG,
+                         "C6 id=%u addr=0x%04x is already in server NVS; "
+                         "erase server Mesh NVS and reset all C6 nodes before "
+                         "reprovisioning",
+                         device_id, target_addr);
+            }
+            break;
+        }
+        if (s_provisioning_active) {
+            /* Only one provisioning link can be active. Other devices keep
+             * advertising and will be handled after this link closes. */
+            break;
+        }
+        if (!has_free_runtime_node_slot()) {
+            ESP_LOGE(TAG,
+                     "reject C6 id=%u: runtime node capacity %u is full",
+                     device_id, (unsigned)ARRAY_SIZE(s_nodes));
+            break;
+        }
+
+        esp_err_t err = esp_ble_mesh_provisioner_prov_device_with_addr(
+            uuid, param->provisioner_recv_unprov_adv_pkt.addr,
+            param->provisioner_recv_unprov_adv_pkt.addr_type,
+            param->provisioner_recv_unprov_adv_pkt.bearer,
+            param->provisioner_recv_unprov_adv_pkt.oob_info, target_addr);
+        if (err == ESP_OK) {
+            s_provisioning_active = true;
+            s_pending_device_id = device_id;
+            memcpy(s_pending_device_uuid, uuid,
+                   sizeof(s_pending_device_uuid));
+            ESP_LOGI(TAG,
+                     "provisioning C6 id=%u with fixed addr=0x%04x",
+                     device_id, target_addr);
+        }
         if (err != ESP_OK) {
-            ESP_LOGW(TAG, "could not queue C6 for provisioning: %s",
-                     esp_err_to_name(err));
+            ESP_LOGW(TAG,
+                     "could not start C6 id=%u provisioning: %s",
+                     device_id, esp_err_to_name(err));
         }
         break;
     }
+    case ESP_BLE_MESH_PROVISIONER_PROV_DEV_WITH_ADDR_COMP_EVT:
+        if (param->provisioner_prov_dev_with_addr_comp.err_code != ESP_OK) {
+            ESP_LOGE(TAG,
+                     "fixed-address provisioning start failed id=%u err=%d",
+                     s_pending_device_id,
+                     param->provisioner_prov_dev_with_addr_comp.err_code);
+            s_provisioning_active = false;
+            s_pending_device_id = 0U;
+            memset(s_pending_device_uuid, 0, sizeof(s_pending_device_uuid));
+        }
+        break;
+    case ESP_BLE_MESH_PROVISIONER_PROV_LINK_CLOSE_EVT:
+        if (s_provisioning_active) {
+            ESP_LOGI(TAG,
+                     "provisioning link closed id=%u reason=0x%02x",
+                     s_pending_device_id,
+                     param->provisioner_prov_link_close.reason);
+        }
+        s_provisioning_active = false;
+        s_pending_device_id = 0U;
+        memset(s_pending_device_uuid, 0, sizeof(s_pending_device_uuid));
+        break;
     case ESP_BLE_MESH_PROVISIONER_PROV_COMPLETE_EVT: {
+        /* Keep the attempt reserved until PROV_LINK_CLOSE.  ESP-IDF reports
+         * COMPLETE before closing the link; clearing here could let an older
+         * CLOSE event cancel a newly-started device. */
+        const uint8_t *completed_uuid =
+            param->provisioner_prov_complete.device_uuid;
+        const uint16_t completed_id = device_id_from_uuid(completed_uuid);
+        if (!s_provisioning_active || completed_id != s_pending_device_id ||
+            memcmp(completed_uuid, s_pending_device_uuid,
+                   sizeof(s_pending_device_uuid)) != 0) {
+            ESP_LOGE(TAG,
+                     "ignore mismatched provisioning completion id=%u "
+                     "pending=%u active=%u",
+                     completed_id, s_pending_device_id,
+                     s_provisioning_active ? 1U : 0U);
+            break;
+        }
         configured_node_t *node = store_node(
-            param->provisioner_prov_complete.device_uuid,
+            completed_uuid,
             param->provisioner_prov_complete.unicast_addr,
             param->provisioner_prov_complete.element_num);
         if (node == NULL) {
-            ESP_LOGE(TAG, "node table full after provisioning 0x%04x",
+            ESP_LOGE(TAG,
+                     "provisioned node identity/address validation failed "
+                     "at 0x%04x; erase server Mesh NVS and reset every "
+                     "registered C6 before retrying",
                      param->provisioner_prov_complete.unicast_addr);
             break;
         }
-        ESP_LOGI(TAG, "C6 provisioned addr=0x%04x elements=%u",
-                 node->unicast, node->element_count);
+        ESP_LOGI(TAG, "C6 provisioned id=%u addr=0x%04x elements=%u",
+                 node->device_id, node->unicast, node->element_count);
         node->retries = 0U;
         esp_err_t err = send_node_config(
             node, ESP_BLE_MESH_MODEL_OP_APP_KEY_ADD);
@@ -469,7 +809,7 @@ static void provisioning_callback(esp_ble_mesh_prov_cb_event_t event,
         break;
     case ESP_BLE_MESH_PROVISIONER_BIND_APP_KEY_TO_MODEL_COMP_EVT:
         if (param->provisioner_bind_app_key_to_model_comp.err_code == ESP_OK) {
-            ESP_ERROR_CHECK_WITHOUT_ABORT(enable_provisioning());
+            mark_gateway_ready();
         } else {
             ESP_LOGE(TAG, "local Gateway model bind failed: %d",
                      param->provisioner_bind_app_key_to_model_comp.err_code);
@@ -519,8 +859,9 @@ static void config_client_callback(esp_ble_mesh_cfg_client_cb_event_t event,
              * look READY while all vendor traffic fails authentication. A
              * repeated Add of the same persisted key is idempotent SUCCESS.
              */
-            ESP_LOGE(TAG, "C6 AppKey status=%u addr=0x%04x; "
-                          "key conflict requires node reset/reprovision",
+            ESP_LOGE(TAG, "C6 AppKey status=%u addr=0x%04x; erase server "
+                          "Mesh NVS and reset every registered C6 before "
+                          "reprovisioning",
                      status, node->unicast);
             return;
         }
@@ -541,8 +882,9 @@ static void config_client_callback(esp_ble_mesh_cfg_client_cb_event_t event,
         if (param->status_cb.model_pub_status.status == 0U) {
             node->pending_opcode = 0U;
             node->retries = 0U;
-            ESP_LOGI(TAG, "C6 image model ready addr=0x%04x ttl=%u",
-                     node->unicast, CONTROL_TTL);
+            ESP_LOGI(TAG,
+                     "C6 image model ready id=%u addr=0x%04x ttl=%u",
+                     node->device_id, node->unicast, CONTROL_TTL);
         } else {
             ESP_LOGE(TAG, "C6 publication status=%u addr=0x%04x",
                      param->status_cb.model_pub_status.status,
@@ -574,21 +916,32 @@ static uint8_t raw_image_opcode(uint32_t opcode)
     if (opcode == IMAGE_OPCODE(BLE_MESH_IMAGE_OP_END)) {
         return BLE_MESH_IMAGE_OP_END;
     }
+    if (opcode == IMAGE_OPCODE(BLE_MESH_IMAGE_OP_TIME_REQUEST)) {
+        return BLE_MESH_IMAGE_OP_TIME_REQUEST;
+    }
     return 0U;
 }
 
-static esp_err_t send_reply(const image_reassembly_reply_t *reply)
+static esp_err_t send_vendor_message(uint16_t destination, uint8_t opcode,
+                                     const uint8_t *payload,
+                                     size_t payload_len)
 {
     esp_ble_mesh_msg_ctx_t context = {
         .net_idx = PRIMARY_NET_IDX,
         .app_idx = IMAGE_APP_IDX,
-        .addr = reply->destination,
+        .addr = destination,
         .send_ttl = CONTROL_TTL,
     };
     return esp_ble_mesh_client_model_send_msg(
-        &s_vendor_models[0], &context, IMAGE_OPCODE(reply->opcode),
-        (uint16_t)reply->payload_len, (uint8_t *)reply->payload,
+        &s_vendor_models[0], &context, IMAGE_OPCODE(opcode),
+        (uint16_t)payload_len, (uint8_t *)payload,
         0, false, ROLE_PROVISIONER);
+}
+
+static esp_err_t send_reply(const image_reassembly_reply_t *reply)
+{
+    return send_vendor_message(reply->destination, reply->opcode,
+                               reply->payload, reply->payload_len);
 }
 
 static bool sample_time_provider(uint64_t *unix_ms)
@@ -603,6 +956,53 @@ static bool sample_time_provider(uint64_t *unix_ms)
     return provider != NULL && provider(unix_ms, provider_ctx);
 }
 
+static void handle_time_request(const esp_ble_mesh_msg_ctx_t *context,
+                                const uint8_t *message, size_t message_len)
+{
+    if (context == NULL || message == NULL ||
+        message_len != sizeof(ble_mesh_time_request_t)) {
+        ESP_LOGW(TAG, "ignored malformed TIME_REQUEST src=0x%04x bytes=%u",
+                 context == NULL ? 0U : context->addr,
+                 (unsigned)message_len);
+        return;
+    }
+
+    uint32_t request_id = ble_mesh_image_get_le32(message);
+    uint64_t server_rx_unix_ms = 0U;
+    bool rx_valid = sample_time_provider(&server_rx_unix_ms);
+
+    uint8_t status[sizeof(ble_mesh_time_status_message_t)] = {0};
+    ble_mesh_image_put_le32(status, request_id);
+    status[4] = BLE_MESH_TIME_STATUS_UNAVAILABLE;
+
+    uint64_t server_tx_unix_ms = 0U;
+    if (rx_valid && sample_time_provider(&server_tx_unix_ms) &&
+        server_tx_unix_ms >= server_rx_unix_ms) {
+        status[4] = BLE_MESH_TIME_STATUS_OK;
+        ble_mesh_image_put_le64(status + 8U, server_rx_unix_ms);
+        ble_mesh_image_put_le64(status + 16U, server_tx_unix_ms);
+    } else {
+        server_rx_unix_ms = 0U;
+        server_tx_unix_ms = 0U;
+    }
+
+    esp_err_t err = send_vendor_message(
+        context->addr, BLE_MESH_IMAGE_OP_TIME_STATUS,
+        status, sizeof(status));
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG,
+                 "TIME_STATUS src=0x%04x request=%lu status=%u rx_ms=%llu "
+                 "tx_ms=%llu",
+                 context->addr, (unsigned long)request_id, status[4],
+                 (unsigned long long)server_rx_unix_ms,
+                 (unsigned long long)server_tx_unix_ms);
+    } else {
+        ESP_LOGW(TAG, "TIME_STATUS src=0x%04x request=%lu failed: %s",
+                 context->addr, (unsigned long)request_id,
+                 esp_err_to_name(err));
+    }
+}
+
 static void publish_complete(const image_reassembly_complete_t *complete)
 {
     mesh_image_gateway_image_cb_t callback;
@@ -615,6 +1015,8 @@ static void publish_complete(const image_reassembly_complete_t *complete)
 
     mesh_image_gateway_image_t image = {
         .source_addr = complete->source_addr,
+        .device_id =
+            mesh_image_gateway_device_id_from_addr(complete->source_addr),
         .event_time_ms = complete->detected_at_ms,
         .time_source = complete->detected_at_ms != 0U ?
                        SERVER_TIME_P4_DETECTED :
@@ -666,10 +1068,17 @@ static void custom_model_callback(esp_ble_mesh_model_cb_event_t event,
     }
 
     uint8_t opcode = raw_image_opcode(received_opcode);
+    configured_node_t *source_node = find_node(context->addr);
     if (opcode == 0U || context->net_idx != PRIMARY_NET_IDX ||
         context->app_idx != IMAGE_APP_IDX ||
         !ESP_BLE_MESH_ADDR_IS_UNICAST(context->addr) ||
-        esp_ble_mesh_provisioner_get_node_with_addr(context->addr) == NULL) {
+        source_node == NULL ||
+        device_addr_from_id(source_node->device_id) != context->addr) {
+        return;
+    }
+
+    if (opcode == BLE_MESH_IMAGE_OP_TIME_REQUEST) {
+        handle_time_request(context, received_message, received_length);
         return;
     }
 
@@ -765,8 +1174,9 @@ static void custom_model_callback(esp_ble_mesh_model_cb_event_t event,
     }
     if (complete.valid) {
         ESP_LOGI(TAG,
-                 "frame complete src=0x%04x frame=%u bytes=%u "
+                 "frame complete id=%u src=0x%04x frame=%u bytes=%u "
                  "crc=ok jpeg=224x224 detected_at_ms=%" PRIu64,
+                 mesh_image_gateway_device_id_from_addr(complete.source_addr),
                  complete.source_addr, complete.frame_id,
                  (unsigned)complete.jpeg_len, complete.detected_at_ms);
         publish_complete(&complete);
@@ -914,19 +1324,11 @@ esp_err_t mesh_image_gateway_init(void)
         return err;
     }
 
-    const uint8_t *existing = esp_ble_mesh_provisioner_get_local_app_key(
-        PRIMARY_NET_IDX, IMAGE_APP_IDX);
-    if (existing != NULL) {
-        memcpy(s_app_key, existing, sizeof(s_app_key));
-        err = local_gateway_model_is_bound() ?
-              enable_provisioning() : bind_local_gateway_model();
-    } else {
-        err = load_or_create_app_key();
-        if (err == ESP_OK) {
-            err = esp_ble_mesh_provisioner_add_local_app_key(
-                s_app_key, PRIMARY_NET_IDX, IMAGE_APP_IDX);
-        }
-    }
+    /* PROV_ENABLE creates/restores the primary network.  The completion
+     * callback performs AppKey add/bind only after NetKey 0 is usable. */
+    err = esp_ble_mesh_provisioner_prov_enable(
+        (esp_ble_mesh_prov_bearer_t)(ESP_BLE_MESH_PROV_ADV |
+                                     ESP_BLE_MESH_PROV_GATT));
     if (err != ESP_OK) {
         return err;
     }

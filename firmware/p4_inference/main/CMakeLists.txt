@@ -13,6 +13,7 @@ include(${cmake_dir}/utilities.cmake)
 set(srcs
     "simple_video_server_example.c"
     "sdio_frame_tx.c"
+    "sdio_time_clock.c"
     "infer_bridge.cpp")
 
 set(classifier_model "${CMAKE_CURRENT_LIST_DIR}/../../../model/artifacts/espdl/classifier_224_p4.espdl")

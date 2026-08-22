@@ -9,8 +9,10 @@ extern "C" {
 
 #define SDIO_FRAME_MSG_ID               0x504A5047u
 #define SDIO_FRAME_CONTROL_MSG_ID       0x5043544Cu
+#define SDIO_TIME_MSG_ID                0x5054494Du
 #define SDIO_FRAME_MAGIC                0x46544A50u
 #define SDIO_FRAME_CONTROL_MAGIC        0x4354524Cu
+#define SDIO_TIME_MAGIC                 0x54494D45u
 #define SDIO_FRAME_VERSION              3U
 #define SDIO_FRAME_CHUNK_DATA_MAX       7600U
 #define SDIO_FRAME_MAX_JPEG_SIZE        30720U
@@ -42,6 +44,20 @@ typedef enum {
     SDIO_FRAME_REASON_INTERNAL,
 } sdio_frame_control_reason_t;
 
+typedef enum {
+    SDIO_TIME_KIND_QUERY = 1,
+    SDIO_TIME_KIND_SAMPLE,
+} sdio_time_kind_t;
+
+typedef enum {
+    SDIO_TIME_STATUS_NONE = 0,
+    SDIO_TIME_STATUS_OK,
+    SDIO_TIME_STATUS_NOT_READY,
+    SDIO_TIME_STATUS_BUSY,
+    SDIO_TIME_STATUS_UNAVAILABLE,
+    SDIO_TIME_STATUS_FAILED,
+} sdio_time_status_t;
+
 typedef struct __attribute__((packed)) {
     uint32_t magic;
     uint16_t version;
@@ -69,6 +85,20 @@ typedef struct __attribute__((packed)) {
     uint32_t detail;
 } sdio_frame_control_t;
 
+/* Bidirectional server-clock exchange. All timestamps use microseconds for
+ * the P4 monotonic clock and Unix milliseconds for the server wall clock. */
+typedef struct __attribute__((packed)) {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t size;
+    uint16_t kind;
+    uint16_t status;
+    uint32_t request_id;
+    uint64_t client_tx_monotonic_us;
+    uint64_t server_rx_unix_ms;
+    uint64_t server_tx_unix_ms;
+} sdio_time_message_t;
+
 #ifdef __cplusplus
 static_assert(offsetof(sdio_frame_chunk_header_t, detected_at_ms) == 32,
               "Unexpected SDIO frame detection timestamp offset");
@@ -78,6 +108,8 @@ static_assert(sizeof(sdio_frame_chunk_header_t) == 44,
               "Unexpected SDIO frame chunk header size");
 static_assert(sizeof(sdio_frame_control_t) == 24,
               "Unexpected SDIO frame control size");
+static_assert(sizeof(sdio_time_message_t) == 40,
+              "Unexpected SDIO time message size");
 static_assert(SDIO_FRAME_CONTROL_SERVER_ACKED == 6,
               "Unexpected SDIO server acknowledgement state value");
 #else
@@ -89,6 +121,8 @@ _Static_assert(sizeof(sdio_frame_chunk_header_t) == 44,
                "Unexpected SDIO frame chunk header size");
 _Static_assert(sizeof(sdio_frame_control_t) == 24,
                "Unexpected SDIO frame control size");
+_Static_assert(sizeof(sdio_time_message_t) == 40,
+               "Unexpected SDIO time message size");
 _Static_assert(SDIO_FRAME_CONTROL_SERVER_ACKED == 6,
                "Unexpected SDIO server acknowledgement state value");
 #endif

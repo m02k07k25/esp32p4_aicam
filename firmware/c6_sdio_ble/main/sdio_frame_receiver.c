@@ -40,6 +40,8 @@ typedef enum {
     WORK_SEND_CONTROL,
     WORK_FRAME_COMPLETE,
     WORK_BLE_FRAME_DONE,
+    WORK_SEND_TIME_SAMPLE,
+    WORK_BLE_TIME_DONE,
 } worker_event_kind_t;
 
 typedef struct {
@@ -50,6 +52,7 @@ typedef struct {
     uint16_t ble_frame_id;
     uint32_t detail;
     esp_err_t result;
+    sdio_time_message_t time;
 } worker_event_t;
 
 typedef struct {
@@ -143,6 +146,45 @@ static void enqueue_control(sdio_frame_control_state_t state,
         .ble_frame_id = ble_frame_id,
         .detail = detail,
     };
+    (void)enqueue_event(&event);
+}
+
+static worker_event_t make_time_sample_event(
+    uint32_t request_id,
+    uint64_t client_tx_monotonic_us,
+    sdio_time_status_t status,
+    uint64_t server_rx_unix_ms,
+    uint64_t server_tx_unix_ms,
+    worker_event_kind_t kind)
+{
+    worker_event_t event = {
+        .kind = kind,
+        .time = {
+            .magic = SDIO_TIME_MAGIC,
+            .version = SDIO_FRAME_VERSION,
+            .size = sizeof(sdio_time_message_t),
+            .kind = SDIO_TIME_KIND_SAMPLE,
+            .status = (uint16_t)status,
+            .request_id = request_id,
+            .client_tx_monotonic_us = client_tx_monotonic_us,
+            .server_rx_unix_ms = status == SDIO_TIME_STATUS_OK
+                                     ? server_rx_unix_ms
+                                     : 0U,
+            .server_tx_unix_ms = status == SDIO_TIME_STATUS_OK
+                                     ? server_tx_unix_ms
+                                     : 0U,
+        },
+    };
+    return event;
+}
+
+static void enqueue_time_sample(uint32_t request_id,
+                                uint64_t client_tx_monotonic_us,
+                                sdio_time_status_t status)
+{
+    const worker_event_t event = make_time_sample_event(
+        request_id, client_tx_monotonic_us, status, 0U, 0U,
+        WORK_SEND_TIME_SAMPLE);
     (void)enqueue_event(&event);
 }
 
@@ -246,6 +288,7 @@ static void frame_chunk_callback(uint32_t msg_id, const uint8_t *data, size_t da
     }
 
     const bool mesh_ready = ble_mesh_image_source_is_ready();
+    const bool mesh_busy = ble_mesh_image_source_is_busy();
 
     taskENTER_CRITICAL(&s_receiver_lock);
 
@@ -278,6 +321,15 @@ static void frame_chunk_callback(uint32_t msg_id, const uint8_t *data, size_t da
                             active_ble_frame_id,
                             SDIO_FRAME_REASON_BUSY,
                             active_frame_id);
+            return;
+        }
+        if (mesh_busy) {
+            taskEXIT_CRITICAL(&s_receiver_lock);
+            enqueue_control(SDIO_FRAME_CONTROL_BUSY,
+                            header.frame_id,
+                            0,
+                            SDIO_FRAME_REASON_BUSY,
+                            0);
             return;
         }
         if (!mesh_ready) {
@@ -472,6 +524,65 @@ static void control_callback(uint32_t msg_id, const uint8_t *data, size_t data_l
     (void)enqueue_event(&event);
 }
 
+/* ESP-Hosted RX context: validate and enqueue only; never transmit here. */
+static void time_query_callback(uint32_t msg_id,
+                                const uint8_t *data,
+                                size_t data_len)
+{
+    sdio_time_message_t query = {0};
+    if (data != NULL && data_len == sizeof(query)) {
+        memcpy(&query, data, sizeof(query));
+    }
+
+    const bool valid = msg_id == SDIO_TIME_MSG_ID && data != NULL &&
+                       data_len == sizeof(query) &&
+                       query.magic == SDIO_TIME_MAGIC &&
+                       query.version == SDIO_FRAME_VERSION &&
+                       query.size == sizeof(query) &&
+                       query.kind == SDIO_TIME_KIND_QUERY &&
+                       query.status == SDIO_TIME_STATUS_NONE &&
+                       query.server_rx_unix_ms == 0U &&
+                       query.server_tx_unix_ms == 0U;
+    if (!valid) {
+        enqueue_time_sample(query.request_id,
+                            query.client_tx_monotonic_us,
+                            SDIO_TIME_STATUS_FAILED);
+        return;
+    }
+
+    receiver_state_t receiver_state;
+    taskENTER_CRITICAL(&s_receiver_lock);
+    receiver_state = s_receiver.state;
+    taskEXIT_CRITICAL(&s_receiver_lock);
+
+    if (receiver_state != RECEIVER_IDLE ||
+        ble_mesh_image_source_is_busy()) {
+        enqueue_time_sample(query.request_id,
+                            query.client_tx_monotonic_us,
+                            SDIO_TIME_STATUS_BUSY);
+        return;
+    }
+    if (!ble_mesh_image_source_is_ready()) {
+        enqueue_time_sample(query.request_id,
+                            query.client_tx_monotonic_us,
+                            SDIO_TIME_STATUS_NOT_READY);
+        return;
+    }
+
+    const esp_err_t err = ble_mesh_image_source_request_time(
+        query.request_id, query.client_tx_monotonic_us);
+    if (err == ESP_OK) {
+        return;
+    }
+    enqueue_time_sample(query.request_id,
+                        query.client_tx_monotonic_us,
+                        err == ESP_ERR_INVALID_STATE
+                            ? SDIO_TIME_STATUS_NOT_READY
+                            : err == ESP_ERR_NOT_FINISHED
+                                  ? SDIO_TIME_STATUS_BUSY
+                                  : SDIO_TIME_STATUS_FAILED);
+}
+
 static void mesh_ready_changed_callback(bool ready, void *user_ctx)
 {
     (void)ready;
@@ -511,6 +622,32 @@ static void mesh_frame_done_callback(uint32_t p4_frame_id,
     configASSERT(queued);
 }
 
+static void mesh_time_done_callback(uint32_t request_id,
+                                    uint64_t client_tx_monotonic_us,
+                                    bool available,
+                                    uint64_t server_rx_unix_ms,
+                                    uint64_t server_tx_unix_ms,
+                                    esp_err_t status,
+                                    void *user_ctx)
+{
+    (void)user_ctx;
+    const sdio_time_status_t sample_status =
+        status != ESP_OK ? SDIO_TIME_STATUS_FAILED
+                         : available ? SDIO_TIME_STATUS_OK
+                                     : SDIO_TIME_STATUS_UNAVAILABLE;
+    const worker_event_t event = make_time_sample_event(
+        request_id,
+        client_tx_monotonic_us,
+        sample_status,
+        server_rx_unix_ms,
+        server_tx_unix_ms,
+        WORK_BLE_TIME_DONE);
+    /* The BLE source serializes image/time work, so this lifecycle mailbox has
+     * no competing BLE completion while a clock request is outstanding. */
+    const bool queued = enqueue_lifecycle_event(&event);
+    configASSERT(queued);
+}
+
 static esp_err_t send_control(sdio_frame_control_state_t state,
                               uint32_t frame_id,
                               uint16_t ble_frame_id,
@@ -542,6 +679,22 @@ static esp_err_t send_control(sdio_frame_control_state_t state,
                  (unsigned int)state,
                  frame_id,
                  esp_err_to_name(ret));
+    }
+    return ret;
+}
+
+static esp_err_t send_time_sample(const sdio_time_message_t *sample)
+{
+    if (sample == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    const esp_err_t ret = esp_hosted_send_custom_data(
+        SDIO_TIME_MSG_ID, (const uint8_t *)sample, sizeof(*sample));
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG,
+                 "time sample send failed request=%" PRIu32
+                 " status=%u: %s",
+                 sample->request_id, sample->status, esp_err_to_name(ret));
     }
     return ret;
 }
@@ -696,6 +849,14 @@ static void handle_ble_frame_done(const worker_event_t *event)
     push_ready_if_available();
 }
 
+static void handle_ble_time_done(const worker_event_t *event)
+{
+    (void)send_time_sample(&event->time);
+    /* ble_mesh_image_source clears its shared outstanding flag before invoking
+     * time_done, so re-advertise image readiness after every terminal sample. */
+    push_ready_if_available();
+}
+
 static void check_assembly_timeout(void)
 {
     uint32_t frame_id = 0;
@@ -734,6 +895,8 @@ static void status_worker(void *arg)
                 submit_completed_frame(event.frame_id);
             } else if (event.kind == WORK_BLE_FRAME_DONE) {
                 handle_ble_frame_done(&event);
+            } else if (event.kind == WORK_BLE_TIME_DONE) {
+                handle_ble_time_done(&event);
             }
             check_assembly_timeout();
             continue;
@@ -762,7 +925,10 @@ static void status_worker(void *arg)
                                    event.frame_id,
                                    event.ble_frame_id,
                                    event.reason,
-                                   event.detail);
+                                    event.detail);
+                break;
+            case WORK_SEND_TIME_SAMPLE:
+                (void)send_time_sample(&event.time);
                 break;
             default:
                 break;
@@ -812,6 +978,7 @@ esp_err_t sdio_frame_receiver_init(void)
     const ble_mesh_image_source_callbacks_t mesh_callbacks = {
         .ready_changed = mesh_ready_changed_callback,
         .frame_done = mesh_frame_done_callback,
+        .time_done = mesh_time_done_callback,
     };
     esp_err_t ret = ble_mesh_image_source_register_callbacks(&mesh_callbacks, NULL);
     if (ret != ESP_OK) {
@@ -831,9 +998,18 @@ esp_err_t sdio_frame_receiver_init(void)
         goto fail;
     }
 
+    ret = esp_hosted_register_custom_callback(SDIO_TIME_MSG_ID,
+                                               time_query_callback);
+    if (ret != ESP_OK) {
+        (void)esp_hosted_register_custom_callback(
+            SDIO_FRAME_CONTROL_MSG_ID, NULL);
+        (void)esp_hosted_register_custom_callback(SDIO_FRAME_MSG_ID, NULL);
+        goto fail;
+    }
+
     s_initialized = true;
     ESP_LOGI(TAG,
-             "SDIO frame receiver ready: protocol v%u, max JPEG=%u bytes",
+             "SDIO frame/time receiver ready: protocol v%u, max JPEG=%u bytes",
              SDIO_FRAME_VERSION,
              SDIO_FRAME_MAX_JPEG_SIZE);
     return ESP_OK;

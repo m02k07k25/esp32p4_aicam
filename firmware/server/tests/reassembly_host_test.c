@@ -81,11 +81,29 @@ static bool test_protocol_layout_and_endian(void)
 {
     EXPECT(sizeof(ble_mesh_image_open_t) == 16U);
     EXPECT(sizeof(ble_mesh_image_data_header_t) == 3U);
+    EXPECT(sizeof(ble_mesh_time_request_t) == 4U);
+    EXPECT(sizeof(ble_mesh_time_status_message_t) == 24U);
     EXPECT(BLE_MESH_IMAGE_DATA_WIRE_MAX == 377U);
     EXPECT(BLE_MESH_IMAGE_MAX_CHUNKS == 83U);
     uint8_t wire[8];
     ble_mesh_image_put_le64(wire, UINT64_C(0x0123456789abcdef));
     EXPECT(ble_mesh_image_get_le64(wire) == UINT64_C(0x0123456789abcdef));
+
+    uint8_t time_status[sizeof(ble_mesh_time_status_message_t)] = {0};
+    ble_mesh_image_put_le32(time_status, UINT32_C(0x89abcdef));
+    time_status[4] = BLE_MESH_TIME_STATUS_OK;
+    ble_mesh_image_put_le64(time_status + 8U,
+                            UINT64_C(1780000000123));
+    ble_mesh_image_put_le64(time_status + 16U,
+                            UINT64_C(1780000000124));
+    EXPECT(ble_mesh_image_get_le32(time_status) == UINT32_C(0x89abcdef));
+    EXPECT(time_status[4] == BLE_MESH_TIME_STATUS_OK);
+    EXPECT(time_status[5] == 0U && time_status[6] == 0U &&
+           time_status[7] == 0U);
+    EXPECT(ble_mesh_image_get_le64(time_status + 8U) ==
+           UINT64_C(1780000000123));
+    EXPECT(ble_mesh_image_get_le64(time_status + 16U) ==
+           UINT64_C(1780000000124));
     static const uint8_t check[] = "123456789";
     EXPECT(esp_crc32_le(0, check, 9U) == UINT32_C(0xcbf43926));
     return true;

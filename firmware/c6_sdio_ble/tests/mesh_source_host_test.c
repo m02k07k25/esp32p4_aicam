@@ -4,6 +4,8 @@
 #include <stdio.h>
 #include <string.h>
 
+#define C6_DEVICE_ID 0x1234U
+
 /*
  * Compile the production BLE image source in this translation unit. Static
  * worker helpers and callbacks are intentionally exercised below; only their
@@ -26,7 +28,7 @@
 typedef struct {
     size_t item_size;
     bool occupied;
-    uint8_t item[sizeof(image_job_t)];
+    uint8_t item[sizeof(worker_job_t)];
 } test_queue_t;
 
 typedef struct {
@@ -38,6 +40,8 @@ typedef enum {
     RESPONSE_SCRIPT_RESTART,
     RESPONSE_SCRIPT_MID_DATA_RESTART,
     RESPONSE_SCRIPT_OPEN_COMPLETE,
+    RESPONSE_SCRIPT_TIME_OK,
+    RESPONSE_SCRIPT_TIME_UNAVAILABLE,
 } response_script_t;
 
 typedef struct {
@@ -65,6 +69,13 @@ static unsigned int g_restart_count;
 static TickType_t g_last_delay_ticks;
 static bool g_mesh_provisioned;
 static response_script_t g_response_script;
+static unsigned int g_time_done_count;
+static uint32_t g_done_time_request_id;
+static uint64_t g_done_client_tx_us;
+static bool g_done_time_available;
+static uint64_t g_done_server_rx_ms;
+static uint64_t g_done_server_tx_ms;
+static esp_err_t g_done_time_status;
 
 #define EXPECT(expression)                                                       \
     do {                                                                         \
@@ -110,6 +121,36 @@ static void dispatch_nack(uint16_t frame_id, uint8_t chunk_index)
     esp_ble_mesh_model_cb_param_t parameter = {
         .model_operation = {
             .opcode = MESH_OPCODE_NACK,
+            .model = &s_vendor_models[0],
+            .length = sizeof(message),
+            .msg = message,
+            .ctx = &context,
+        },
+    };
+    custom_model_callback(ESP_BLE_MESH_MODEL_OPERATION_EVT, &parameter);
+}
+
+static void dispatch_time_status(uint32_t request_id,
+                                 uint8_t status,
+                                 uint64_t server_rx_ms,
+                                 uint64_t server_tx_ms,
+                                 uint16_t source,
+                                 uint16_t net_idx,
+                                 uint16_t app_idx)
+{
+    uint8_t message[sizeof(ble_mesh_time_status_message_t)] = {0};
+    ble_mesh_image_put_le32(message, request_id);
+    message[4] = status;
+    ble_mesh_image_put_le64(message + 8U, server_rx_ms);
+    ble_mesh_image_put_le64(message + 16U, server_tx_ms);
+    esp_ble_mesh_msg_ctx_t context = {
+        .net_idx = net_idx,
+        .app_idx = app_idx,
+        .addr = source,
+    };
+    esp_ble_mesh_model_cb_param_t parameter = {
+        .model_operation = {
+            .opcode = MESH_OPCODE_TIME_STATUS,
             .model = &s_vendor_models[0],
             .length = sizeof(message),
             .msg = message,
@@ -269,6 +310,23 @@ BaseType_t xSemaphoreTake(SemaphoreHandle_t semaphore,
         } else if (g_response_script == RESPONSE_SCRIPT_OPEN_COMPLETE &&
                    g_response_wait_count == 1U) {
             dispatch_frame_response(MESH_OPCODE_COMPLETE, s_active_frame_id);
+        } else if (g_response_script == RESPONSE_SCRIPT_TIME_OK &&
+                   g_response_wait_count == 1U) {
+            dispatch_time_status(s_active_time_request_id,
+                                 BLE_MESH_TIME_STATUS_OK,
+                                 UINT64_C(1760000200000),
+                                 UINT64_C(1760000200002),
+                                 TEST_GATEWAY_ADDR,
+                                 TEST_NET_IDX,
+                                 TEST_APP_IDX);
+        } else if (g_response_script == RESPONSE_SCRIPT_TIME_UNAVAILABLE &&
+                   g_response_wait_count == 1U) {
+            dispatch_time_status(s_active_time_request_id,
+                                 BLE_MESH_TIME_STATUS_UNAVAILABLE,
+                                 0U, 0U,
+                                 TEST_GATEWAY_ADDR,
+                                 TEST_NET_IDX,
+                                 TEST_APP_IDX);
         }
     }
 
@@ -463,10 +521,29 @@ static void frame_done_callback(uint32_t p4_frame_id,
     g_busy_during_done = ble_mesh_image_source_is_busy();
 }
 
+static void time_done_callback(uint32_t request_id,
+                               uint64_t client_tx_monotonic_us,
+                               bool available,
+                               uint64_t server_rx_unix_ms,
+                               uint64_t server_tx_unix_ms,
+                               esp_err_t status,
+                               void *user_ctx)
+{
+    (void)user_ctx;
+    ++g_time_done_count;
+    g_done_time_request_id = request_id;
+    g_done_client_tx_us = client_tx_monotonic_us;
+    g_done_time_available = available;
+    g_done_server_rx_ms = server_rx_unix_ms;
+    g_done_server_tx_ms = server_tx_unix_ms;
+    g_done_time_status = status;
+    g_busy_during_done = ble_mesh_image_source_is_busy();
+}
+
 static void reset_fixture(void)
 {
     memset(&g_job_queue, 0, sizeof(g_job_queue));
-    g_job_queue.item_size = sizeof(image_job_t);
+    g_job_queue.item_size = sizeof(worker_job_t);
     memset(&g_send_done_sem, 0, sizeof(g_send_done_sem));
     memset(&g_response_sem, 0, sizeof(g_response_sem));
     memset(g_packets, 0, sizeof(g_packets));
@@ -484,6 +561,13 @@ static void reset_fixture(void)
     g_last_delay_ticks = 0U;
     g_mesh_provisioned = true;
     g_response_script = RESPONSE_SCRIPT_BUSY_NACK;
+    g_time_done_count = 0U;
+    g_done_time_request_id = 0U;
+    g_done_client_tx_us = 0U;
+    g_done_time_available = false;
+    g_done_server_rx_ms = 0U;
+    g_done_server_tx_ms = 0U;
+    g_done_time_status = ESP_FAIL;
 
     s_job_queue = &g_job_queue;
     s_send_done_sem = &g_send_done_sem;
@@ -501,6 +585,7 @@ static void reset_fixture(void)
     s_app_idx = TEST_APP_IDX;
     s_binding_generation = 9U;
     s_next_frame_id = TEST_BLE_FRAME_ID;
+    s_elements[0].element_addr = C6_EXPECTED_UNICAST_ADDR;
     memset(&s_callbacks, 0, sizeof(s_callbacks));
     s_callback_ctx = NULL;
     s_send_waiting = false;
@@ -516,6 +601,13 @@ static void reset_fixture(void)
     s_active_binding_generation = 0U;
     s_gateway_response = RESPONSE_NONE;
     s_reject_reason = 0U;
+    s_time_active = false;
+    s_active_time_request_id = 0U;
+    s_active_time_net_idx = ESP_BLE_MESH_KEY_UNUSED;
+    s_active_time_app_idx = ESP_BLE_MESH_KEY_UNUSED;
+    s_active_time_destination = 0U;
+    s_active_time_binding_generation = 0U;
+    memset(&s_time_response, 0, sizeof(s_time_response));
     memset(s_nack_bitmap, 0, sizeof(s_nack_bitmap));
     s_image_publication.publish_addr = TEST_GATEWAY_ADDR;
     s_image_publication.app_idx = TEST_APP_IDX;
@@ -575,6 +667,17 @@ static bool packet_is_end(size_t packet_index)
     return true;
 }
 
+static bool packet_is_time_request(size_t packet_index, uint32_t request_id)
+{
+    EXPECT(packet_index < g_packet_count);
+    const sent_packet_t *sent = &g_packets[packet_index];
+    EXPECT(sent->opcode == MESH_OPCODE_TIME_REQUEST);
+    EXPECT(sent->length == sizeof(ble_mesh_time_request_t));
+    EXPECT(packet_has_route(sent));
+    EXPECT(ble_mesh_image_get_le32(sent->data) == request_id);
+    return true;
+}
+
 static bool test_production_mesh_transfer(void)
 {
     reset_fixture();
@@ -596,8 +699,10 @@ static bool test_production_mesh_transfer(void)
     EXPECT(assigned_frame_id == TEST_BLE_FRAME_ID);
     EXPECT(ble_mesh_image_source_is_busy());
 
-    image_job_t queued_job;
-    EXPECT(xQueueReceive(s_job_queue, &queued_job, 0) == pdTRUE);
+    worker_job_t worker_job;
+    EXPECT(xQueueReceive(s_job_queue, &worker_job, 0) == pdTRUE);
+    EXPECT(worker_job.kind == WORKER_JOB_IMAGE);
+    const image_job_t queued_job = worker_job.value.image;
     EXPECT(queued_job.jpeg == jpeg);
     EXPECT(queued_job.len == sizeof(jpeg));
     EXPECT(queued_job.p4_frame_id == TEST_P4_FRAME_ID);
@@ -754,15 +859,159 @@ static bool test_publication_is_required_for_ready(void)
     refresh_ready_state();
     EXPECT(ble_mesh_image_source_is_ready());
 
+    s_elements[0].element_addr = C6_EXPECTED_UNICAST_ADDR + 1U;
+    refresh_ready_state();
+    EXPECT(!ble_mesh_image_source_is_ready());
+
+    s_elements[0].element_addr = C6_EXPECTED_UNICAST_ADDR;
+    refresh_ready_state();
+    EXPECT(ble_mesh_image_source_is_ready());
+
     g_mesh_provisioned = false;
     refresh_ready_state();
     EXPECT(!ble_mesh_image_source_is_ready());
     return true;
 }
 
+static bool test_compile_time_device_identity_uuid(void)
+{
+    static const uint8_t bt_addr[DEVICE_UUID_BT_ADDR_BYTES] = {
+        0xa1U, 0xb2U, 0xc3U, 0xd4U, 0xe5U, 0xf6U,
+    };
+    static const uint8_t expected[ESP_BLE_MESH_OCTET16_LEN] = {
+        0x32U, 0x10U,
+        0xa1U, 0xb2U, 0xc3U, 0xd4U, 0xe5U, 0xf6U,
+        0x34U, 0x12U,
+        0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U,
+    };
+
+    EXPECT(C6_DEVICE_ID == 0x1234U);
+    EXPECT(C6_EXPECTED_UNICAST_ADDR == 0x1235U);
+    build_device_uuid(bt_addr);
+    EXPECT(device_uuid_matches_configuration());
+    EXPECT(device_uuid_id() == C6_DEVICE_ID);
+    EXPECT(memcmp(s_dev_uuid, expected, sizeof(expected)) == 0);
+
+    s_dev_uuid[DEVICE_UUID_RESERVED_OFFSET] = 1U;
+    EXPECT(!device_uuid_matches_configuration());
+    return true;
+}
+
+static bool test_time_request_uses_serial_worker_and_authenticates_status(void)
+{
+    const uint32_t request_id = UINT32_C(0x10203040);
+    const uint64_t client_tx_us = UINT64_C(0x1122334455667788);
+    reset_fixture();
+    g_response_script = RESPONSE_SCRIPT_TIME_OK;
+
+    ble_mesh_image_source_callbacks_t callbacks = {
+        .time_done = time_done_callback,
+    };
+    EXPECT(ble_mesh_image_source_register_callbacks(&callbacks, NULL) == ESP_OK);
+    EXPECT(ble_mesh_image_source_request_time(request_id, client_tx_us) ==
+           ESP_OK);
+    EXPECT(ble_mesh_image_source_is_busy());
+    EXPECT(ble_mesh_image_source_request_time(request_id + 1U,
+                                              client_tx_us + 1U) ==
+           ESP_ERR_NOT_FINISHED);
+
+    worker_job_t worker_job;
+    EXPECT(xQueueReceive(s_job_queue, &worker_job, 0) == pdTRUE);
+    EXPECT(worker_job.kind == WORKER_JOB_TIME);
+    EXPECT(worker_job.value.time.request_id == request_id);
+    EXPECT(worker_job.value.time.client_tx_monotonic_us == client_tx_us);
+
+    time_response_t response = {0};
+    EXPECT(query_server_time(&worker_job.value.time, &response) == ESP_OK);
+    EXPECT(response.received);
+    EXPECT(response.available);
+    EXPECT(response.server_rx_unix_ms == UINT64_C(1760000200000));
+    EXPECT(response.server_tx_unix_ms == UINT64_C(1760000200002));
+    EXPECT(g_packet_count == 1U);
+    EXPECT(packet_is_time_request(0U, request_id));
+    EXPECT(ble_mesh_image_source_is_busy());
+
+    publish_time_done(&worker_job.value.time, &response, ESP_OK);
+    EXPECT(g_time_done_count == 1U);
+    EXPECT(g_done_time_request_id == request_id);
+    EXPECT(g_done_client_tx_us == client_tx_us);
+    EXPECT(g_done_time_available);
+    EXPECT(g_done_server_rx_ms == UINT64_C(1760000200000));
+    EXPECT(g_done_server_tx_ms == UINT64_C(1760000200002));
+    EXPECT(g_done_time_status == ESP_OK);
+    EXPECT(!g_busy_during_done);
+    EXPECT(!ble_mesh_image_source_is_busy());
+    return true;
+}
+
+static bool test_time_status_route_request_and_payload_validation(void)
+{
+    const time_job_t job = {
+        .request_id = UINT32_C(0xaabbccdd),
+        .client_tx_monotonic_us = 123U,
+    };
+    reset_fixture();
+    mesh_route_t route;
+    EXPECT(snapshot_route(&route));
+    begin_active_time(&job, &route);
+
+    dispatch_time_status(job.request_id + 1U, BLE_MESH_TIME_STATUS_OK,
+                         UINT64_C(1760000200000),
+                         UINT64_C(1760000200001),
+                         TEST_GATEWAY_ADDR, TEST_NET_IDX, TEST_APP_IDX);
+    dispatch_time_status(job.request_id, BLE_MESH_TIME_STATUS_OK,
+                         UINT64_C(1760000200000),
+                         UINT64_C(1760000200001),
+                         TEST_GATEWAY_ADDR + 1U,
+                         TEST_NET_IDX, TEST_APP_IDX);
+    dispatch_time_status(job.request_id,
+                         BLE_MESH_TIME_STATUS_UNAVAILABLE,
+                         UINT64_C(1760000200000), 0U,
+                         TEST_GATEWAY_ADDR, TEST_NET_IDX, TEST_APP_IDX);
+    EXPECT(!s_time_response.received);
+    EXPECT(g_response_give_count == 0U);
+
+    dispatch_time_status(job.request_id, BLE_MESH_TIME_STATUS_UNAVAILABLE,
+                         0U, 0U, TEST_GATEWAY_ADDR,
+                         TEST_NET_IDX, TEST_APP_IDX);
+    EXPECT(s_time_response.received);
+    EXPECT(!s_time_response.available);
+    EXPECT(g_response_give_count == 1U);
+    end_active_time();
+    return true;
+}
+
+static bool test_time_request_not_ready_and_unavailable(void)
+{
+    reset_fixture();
+    s_ready = false;
+    EXPECT(ble_mesh_image_source_request_time(1U, 2U) ==
+           ESP_ERR_INVALID_STATE);
+    EXPECT(!ble_mesh_image_source_is_busy());
+
+    reset_fixture();
+    g_response_script = RESPONSE_SCRIPT_TIME_UNAVAILABLE;
+    const time_job_t job = {
+        .request_id = 3U,
+        .client_tx_monotonic_us = 4U,
+    };
+    time_response_t response = {0};
+    EXPECT(query_server_time(&job, &response) == ESP_OK);
+    EXPECT(response.received);
+    EXPECT(!response.available);
+    EXPECT(response.server_rx_unix_ms == 0U);
+    EXPECT(response.server_tx_unix_ms == 0U);
+    return true;
+}
+
 int main(void)
 {
     printf("production BLE Mesh source host tests\n");
+    if (!test_compile_time_device_identity_uuid()) {
+        printf("  FAIL compile-time device identity UUID\n");
+        return 1;
+    }
+    printf("  PASS compile-time device identity UUID\n");
     if (!test_production_mesh_transfer()) {
         printf("  FAIL mesh transfer / NACK repair / zero-copy lifecycle\n");
         return 1;
@@ -793,5 +1042,20 @@ int main(void)
         return 1;
     }
     printf("  PASS provision/bind/publication READY gate\n");
+    if (!test_time_request_uses_serial_worker_and_authenticates_status()) {
+        printf("  FAIL serialized server-time request\n");
+        return 1;
+    }
+    printf("  PASS serialized server-time request\n");
+    if (!test_time_status_route_request_and_payload_validation()) {
+        printf("  FAIL server-time status validation\n");
+        return 1;
+    }
+    printf("  PASS server-time status validation\n");
+    if (!test_time_request_not_ready_and_unavailable()) {
+        printf("  FAIL server-time terminal states\n");
+        return 1;
+    }
+    printf("  PASS server-time terminal states\n");
     return 0;
 }

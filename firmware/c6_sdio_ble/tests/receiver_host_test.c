@@ -16,6 +16,7 @@
 #define TEST_QUEUE_CAPACITY 64U
 #define TEST_QUEUE_ITEM_MAX 128U
 #define TEST_CONTROL_CAPACITY 64U
+#define TEST_TIME_CAPACITY 16U
 #define TEST_BLE_FRAME_ID UINT16_C(0x2345)
 #define TEST_DETECTED_AT_MS UINT64_C(1760000123456)
 
@@ -33,13 +34,18 @@ static int64_t g_now_us;
 static bool g_mesh_ready;
 static bool g_mesh_busy;
 static esp_err_t g_submit_result;
+static esp_err_t g_time_submit_result;
 static const uint8_t *g_submitted_jpeg;
 static size_t g_submitted_size;
 static uint32_t g_submitted_p4_frame_id;
 static uint64_t g_submitted_detected_at_ms;
 static uint32_t g_submitted_jpeg_crc32;
+static uint32_t g_submitted_time_request_id;
+static uint64_t g_submitted_client_tx_us;
 static sdio_frame_control_t g_controls[TEST_CONTROL_CAPACITY];
 static size_t g_control_count;
+static sdio_time_message_t g_time_samples[TEST_TIME_CAPACITY];
+static size_t g_time_sample_count;
 
 #define EXPECT(expression)                                                       \
     do {                                                                         \
@@ -175,15 +181,24 @@ esp_err_t esp_hosted_send_custom_data(uint32_t msg_id,
                                       const uint8_t *data,
                                       size_t data_len)
 {
-    if (msg_id != SDIO_FRAME_CONTROL_MSG_ID || data == NULL ||
-        data_len != sizeof(sdio_frame_control_t) ||
-        g_control_count == TEST_CONTROL_CAPACITY) {
+    if (data == NULL) {
         return ESP_FAIL;
     }
-
-    memcpy(&g_controls[g_control_count], data, data_len);
-    g_control_count++;
-    return ESP_OK;
+    if (msg_id == SDIO_FRAME_CONTROL_MSG_ID &&
+        data_len == sizeof(sdio_frame_control_t) &&
+        g_control_count < TEST_CONTROL_CAPACITY) {
+        memcpy(&g_controls[g_control_count], data, data_len);
+        g_control_count++;
+        return ESP_OK;
+    }
+    if (msg_id == SDIO_TIME_MSG_ID &&
+        data_len == sizeof(sdio_time_message_t) &&
+        g_time_sample_count < TEST_TIME_CAPACITY) {
+        memcpy(&g_time_samples[g_time_sample_count], data, data_len);
+        g_time_sample_count++;
+        return ESP_OK;
+    }
+    return ESP_FAIL;
 }
 
 esp_err_t esp_hosted_register_custom_callback(
@@ -230,6 +245,17 @@ esp_err_t ble_mesh_image_source_submit(const uint8_t *jpeg,
     return g_submit_result;
 }
 
+esp_err_t ble_mesh_image_source_request_time(
+    uint32_t request_id, uint64_t client_tx_monotonic_us)
+{
+    g_submitted_time_request_id = request_id;
+    g_submitted_client_tx_us = client_tx_monotonic_us;
+    if (g_time_submit_result == ESP_OK) {
+        g_mesh_busy = true;
+    }
+    return g_time_submit_result;
+}
+
 bool ble_mesh_image_source_is_ready(void)
 {
     return g_mesh_ready;
@@ -266,13 +292,18 @@ static void reset_fixture(void)
     g_mesh_ready = true;
     g_mesh_busy = false;
     g_submit_result = ESP_OK;
+    g_time_submit_result = ESP_OK;
     g_submitted_jpeg = NULL;
     g_submitted_size = 0;
     g_submitted_p4_frame_id = 0;
     g_submitted_detected_at_ms = 0;
     g_submitted_jpeg_crc32 = 0;
+    g_submitted_time_request_id = 0U;
+    g_submitted_client_tx_us = 0U;
     memset(g_controls, 0, sizeof(g_controls));
     g_control_count = 0;
+    memset(g_time_samples, 0, sizeof(g_time_samples));
+    g_time_sample_count = 0U;
     s_worker_queue = &g_queue;
     s_lifecycle_queue = &g_lifecycle_queue;
     s_mesh_ready_event_pending = false;
@@ -288,6 +319,8 @@ static bool process_next_event(void)
             submit_completed_frame(event.frame_id);
         } else if (event.kind == WORK_BLE_FRAME_DONE) {
             handle_ble_frame_done(&event);
+        } else if (event.kind == WORK_BLE_TIME_DONE) {
+            handle_ble_time_done(&event);
         } else {
             return false;
         }
@@ -313,6 +346,9 @@ static bool process_next_event(void)
                            event.ble_frame_id,
                            event.reason,
                            event.detail);
+        break;
+    case WORK_SEND_TIME_SAMPLE:
+        (void)send_time_sample(&event.time);
         break;
     default:
         return false;
@@ -387,7 +423,23 @@ static void dispatch_query(uint32_t frame_id)
     };
     control_callback(SDIO_FRAME_CONTROL_MSG_ID,
                      (const uint8_t *)&query,
-                     sizeof(query));
+                      sizeof(query));
+}
+
+static void dispatch_time_query(uint32_t request_id, uint64_t client_tx_us)
+{
+    const sdio_time_message_t query = {
+        .magic = SDIO_TIME_MAGIC,
+        .version = SDIO_FRAME_VERSION,
+        .size = sizeof(sdio_time_message_t),
+        .kind = SDIO_TIME_KIND_QUERY,
+        .status = SDIO_TIME_STATUS_NONE,
+        .request_id = request_id,
+        .client_tx_monotonic_us = client_tx_us,
+    };
+    time_query_callback(SDIO_TIME_MSG_ID,
+                        (const uint8_t *)&query,
+                        sizeof(query));
 }
 
 static bool expect_control(size_t index,
@@ -402,6 +454,23 @@ static bool expect_control(size_t index,
     EXPECT(g_controls[index].state == (uint16_t)state);
     EXPECT(g_controls[index].reason == (uint16_t)reason);
     EXPECT(g_controls[index].frame_id == frame_id);
+    return true;
+}
+
+static bool expect_time_sample(size_t index,
+                               sdio_time_status_t status,
+                               uint32_t request_id,
+                               uint64_t client_tx_us)
+{
+    EXPECT(index < g_time_sample_count);
+    const sdio_time_message_t *sample = &g_time_samples[index];
+    EXPECT(sample->magic == SDIO_TIME_MAGIC);
+    EXPECT(sample->version == SDIO_FRAME_VERSION);
+    EXPECT(sample->size == sizeof(*sample));
+    EXPECT(sample->kind == SDIO_TIME_KIND_SAMPLE);
+    EXPECT(sample->status == (uint16_t)status);
+    EXPECT(sample->request_id == request_id);
+    EXPECT(sample->client_tx_monotonic_us == client_tx_us);
     return true;
 }
 
@@ -851,6 +920,85 @@ static bool test_terminal_survives_full_status_queue(void)
     return true;
 }
 
+static bool test_time_query_bridge_and_ready_restore(void)
+{
+    const uint32_t request_id = UINT32_C(0x89abcdef);
+    const uint64_t client_tx_us = UINT64_C(123456789);
+    const uint64_t server_rx_ms = UINT64_C(1760000123000);
+    const uint64_t server_tx_ms = UINT64_C(1760000123002);
+    reset_fixture();
+
+    dispatch_time_query(request_id, client_tx_us);
+    EXPECT(g_submitted_time_request_id == request_id);
+    EXPECT(g_submitted_client_tx_us == client_tx_us);
+    EXPECT(g_mesh_busy);
+    EXPECT(g_time_sample_count == 0U);
+
+    /* A frame cannot overtake the queued clock operation. */
+    uint8_t jpeg[10];
+    fill_jpeg(jpeg, sizeof(jpeg));
+    const uint32_t crc = esp_crc32_le(0, jpeg, sizeof(jpeg));
+    const sdio_frame_chunk_header_t header =
+        make_header(1700, 0, 2, 0, 5, sizeof(jpeg), crc);
+    dispatch_chunk(&header, jpeg);
+    EXPECT(process_next_event());
+    EXPECT(expect_control(0, SDIO_FRAME_CONTROL_BUSY,
+                          SDIO_FRAME_REASON_BUSY, 1700));
+
+    g_mesh_busy = false;
+    mesh_time_done_callback(request_id, client_tx_us, true,
+                            server_rx_ms, server_tx_ms, ESP_OK, NULL);
+    EXPECT(process_next_event());
+    EXPECT(g_time_sample_count == 1U);
+    EXPECT(expect_time_sample(0, SDIO_TIME_STATUS_OK,
+                              request_id, client_tx_us));
+    EXPECT(g_time_samples[0].server_rx_unix_ms == server_rx_ms);
+    EXPECT(g_time_samples[0].server_tx_unix_ms == server_tx_ms);
+    EXPECT(g_control_count == 2U);
+    EXPECT(expect_control(1, SDIO_FRAME_CONTROL_READY,
+                          SDIO_FRAME_REASON_NONE, 0U));
+    return true;
+}
+
+static bool test_time_query_explicit_terminal_statuses(void)
+{
+    const uint32_t request_id = 1710U;
+    const uint64_t client_tx_us = 4567U;
+
+    reset_fixture();
+    g_mesh_ready = false;
+    dispatch_time_query(request_id, client_tx_us);
+    EXPECT(process_next_event());
+    EXPECT(expect_time_sample(0, SDIO_TIME_STATUS_NOT_READY,
+                              request_id, client_tx_us));
+
+    reset_fixture();
+    g_mesh_busy = true;
+    dispatch_time_query(request_id + 1U, client_tx_us + 1U);
+    EXPECT(process_next_event());
+    EXPECT(expect_time_sample(0, SDIO_TIME_STATUS_BUSY,
+                              request_id + 1U, client_tx_us + 1U));
+
+    reset_fixture();
+    g_time_submit_result = ESP_FAIL;
+    dispatch_time_query(request_id + 2U, client_tx_us + 2U);
+    EXPECT(process_next_event());
+    EXPECT(expect_time_sample(0, SDIO_TIME_STATUS_FAILED,
+                              request_id + 2U, client_tx_us + 2U));
+
+    reset_fixture();
+    dispatch_time_query(request_id + 3U, client_tx_us + 3U);
+    g_mesh_busy = false;
+    mesh_time_done_callback(request_id + 3U, client_tx_us + 3U, false,
+                            0U, 0U, ESP_OK, NULL);
+    EXPECT(process_next_event());
+    EXPECT(expect_time_sample(0, SDIO_TIME_STATUS_UNAVAILABLE,
+                              request_id + 3U, client_tx_us + 3U));
+    EXPECT(g_time_samples[0].server_rx_unix_ms == 0U);
+    EXPECT(g_time_samples[0].server_tx_unix_ms == 0U);
+    return true;
+}
+
 typedef bool (*test_function_t)(void);
 
 typedef struct {
@@ -876,6 +1024,8 @@ int main(void)
         {"stale BLE completion", test_stale_ble_completion_is_ignored},
         {"lost FAILED terminal replay", test_failed_terminal_is_replayed_after_control_loss},
         {"terminal survives full queue", test_terminal_survives_full_status_queue},
+        {"time QUERY bridge / READY restore", test_time_query_bridge_and_ready_restore},
+        {"time explicit terminal statuses", test_time_query_explicit_terminal_statuses},
     };
 
     size_t passed = 0;

@@ -18,8 +18,10 @@ int main(void)
 {
     CHECK(SDIO_FRAME_MSG_ID == UINT32_C(0x504a5047));
     CHECK(SDIO_FRAME_CONTROL_MSG_ID == UINT32_C(0x5043544c));
+    CHECK(SDIO_TIME_MSG_ID == UINT32_C(0x5054494d));
     CHECK(SDIO_FRAME_MAGIC == UINT32_C(0x46544a50));
     CHECK(SDIO_FRAME_CONTROL_MAGIC == UINT32_C(0x4354524c));
+    CHECK(SDIO_TIME_MAGIC == UINT32_C(0x54494d45));
     CHECK(SDIO_FRAME_VERSION == 3);
     CHECK(SDIO_FRAME_CHUNK_DATA_MAX == 7600);
     CHECK(SDIO_FRAME_MAX_JPEG_SIZE == 30720);
@@ -32,6 +34,10 @@ int main(void)
     CHECK(SDIO_FRAME_CONTROL_SERVER_ACKED == 6);
     CHECK(SDIO_FRAME_CONTROL_FAILED == 7);
     CHECK(SDIO_FRAME_REASON_INTERNAL == 11);
+    CHECK(SDIO_TIME_KIND_QUERY == 1);
+    CHECK(SDIO_TIME_KIND_SAMPLE == 2);
+    CHECK(SDIO_TIME_STATUS_OK == 1);
+    CHECK(SDIO_TIME_STATUS_FAILED == 5);
 
     CHECK(sizeof(sdio_frame_chunk_header_t) == 44);
     CHECK(offsetof(sdio_frame_chunk_header_t, magic) == 0);
@@ -71,6 +77,34 @@ int main(void)
         0xbc, 0x9a, 0x00, 0x00, 0x04, 0x03, 0x02, 0x01,
     };
     CHECK(memcmp(&control, expected, sizeof(expected)) == 0);
+
+    CHECK(sizeof(sdio_time_message_t) == 40);
+    CHECK(offsetof(sdio_time_message_t, kind) == 8);
+    CHECK(offsetof(sdio_time_message_t, status) == 10);
+    CHECK(offsetof(sdio_time_message_t, request_id) == 12);
+    CHECK(offsetof(sdio_time_message_t, client_tx_monotonic_us) == 16);
+    CHECK(offsetof(sdio_time_message_t, server_rx_unix_ms) == 24);
+    CHECK(offsetof(sdio_time_message_t, server_tx_unix_ms) == 32);
+
+    const sdio_time_message_t sample = {
+        .magic = SDIO_TIME_MAGIC,
+        .version = SDIO_FRAME_VERSION,
+        .size = sizeof(sdio_time_message_t),
+        .kind = SDIO_TIME_KIND_SAMPLE,
+        .status = SDIO_TIME_STATUS_OK,
+        .request_id = UINT32_C(0x12345678),
+        .client_tx_monotonic_us = UINT64_C(0x0102030405060708),
+        .server_rx_unix_ms = UINT64_C(0x1112131415161718),
+        .server_tx_unix_ms = UINT64_C(0x2122232425262728),
+    };
+    const uint8_t expected_sample[40] = {
+        0x45, 0x4d, 0x49, 0x54, 0x03, 0x00, 0x28, 0x00,
+        0x02, 0x00, 0x01, 0x00, 0x78, 0x56, 0x34, 0x12,
+        0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,
+        0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11,
+        0x28, 0x27, 0x26, 0x25, 0x24, 0x23, 0x22, 0x21,
+    };
+    CHECK(memcmp(&sample, expected_sample, sizeof(expected_sample)) == 0);
 
     puts("protocol layout: PASS");
     return 0;

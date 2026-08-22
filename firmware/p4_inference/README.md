@@ -20,26 +20,30 @@ idf.py build
 idf.py -p COM_P4 flash monitor
 ```
 
-## Detection timestamp and SDIO v3
+## Server-authoritative timestamp and SDIO v3
 
-After Ethernet connects, the firmware starts SNTP without blocking camera or
-inference startup. Configure the clock source in `menuconfig` or
-`sdkconfig.defaults`:
+P4 does not run SNTP. The Mesh Gateway is the sole wall-clock authority and
+obtains time through its own SNTP configuration. While C6 is READY and no
+image is in flight, P4 periodically sends a small `SDIO_TIME_MSG_ID` query.
+C6 forwards the request to the configured Gateway and returns the Gateway's
+receive/transmit Unix timestamps. P4 uses the request/response monotonic
+timestamps to estimate a local monotonic-to-Unix mapping without changing the
+ESP system clock.
 
-```text
-CONFIG_P4_INFERENCE_SNTP_ENABLE=y
-CONFIG_P4_INFERENCE_SNTP_SERVER="pool.ntp.org"
-```
+The mapping is refreshed every five minutes and expires after fifteen minutes.
+Transport disconnect, C6 restart, a stale request ID, an inconsistent timestamp
+pair, or an excessive round trip invalidates or rejects the sample. The
+periodic task records the resulting Unix milliseconds immediately after
+dequeuing the fresh camera frame and before inference. Until the first valid
+Gateway sample, or after expiry, `detected_at_ms` is zero; the Gateway may then
+use its OPEN receive time as an estimate.
 
-Use a LAN NTP address when Internet NTP is unavailable. The periodic task
-records Unix epoch milliseconds immediately after dequeuing the fresh camera
-frame and before inference. Until the first successful SNTP update, or when
-SNTP is disabled, `detected_at_ms` is zero.
-
-SDIO protocol v3 sends only JPEG transport fields, the capture timestamp, and
-the complete JPEG CRC32 in its 44-byte chunk header. The public submission API
-is `sdio_frame_tx_submit_event(jpeg, jpeg_len, detected_at_ms)`. A transfer is
-terminally successful only when C6 reports `SERVER_ACKED`; this means the Mesh
-server positively acknowledged the reconstructed frame.
+The 44-byte SDIO image protocol v3 ABI is unchanged: it sends only JPEG
+transport fields, the server-derived capture timestamp, and the complete JPEG
+CRC32. The separate TIME exchange is a fixed 40-byte message. The public image
+submission API is `sdio_frame_tx_submit_event(jpeg, jpeg_len,
+detected_at_ms)`. A transfer is terminally successful only when C6 reports
+`SERVER_ACKED`; this means the Mesh server positively acknowledged the
+reconstructed frame.
 
 빌드는 저장소 루트의 `model/artifacts/espdl/classifier_224_p4.espdl`과 짝이 맞는 `.json` 매니페스트를 검사합니다. 파일이 없거나 SHA-256·전처리·라벨·threshold 정보가 다르면 구성 단계에서 중단됩니다.

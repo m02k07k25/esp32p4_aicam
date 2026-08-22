@@ -10,7 +10,6 @@
 #include <sys/mman.h>
 #include <sys/param.h>
 #include <sys/errno.h>
-#include <sys/time.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "esp_event.h"
@@ -21,9 +20,6 @@
 #include "nvs_flash.h"
 #include "esp_http_server.h"
 #include "sdkconfig.h"
-#if CONFIG_P4_INFERENCE_SNTP_ENABLE
-#include "esp_netif_sntp.h"
-#endif
 #include "protocol_examples_common.h"
 #include "linux/videodev2.h"
 #include "esp_video_init.h"
@@ -89,55 +85,6 @@ typedef enum {
 
 const int s_queue_buf_type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 static const char *TAG = "example";
-
-#define APP_MIN_VALID_EPOCH_SECONDS 1704067200LL /* 2024-01-01 UTC */
-
-#if CONFIG_P4_INFERENCE_SNTP_ENABLE
-static volatile bool s_time_synchronized;
-
-static void app_sntp_sync_callback(struct timeval *tv)
-{
-    if (tv == NULL || (int64_t)tv->tv_sec < APP_MIN_VALID_EPOCH_SECONDS) {
-        return;
-    }
-
-    s_time_synchronized = true;
-    ESP_LOGI(TAG,
-             "SNTP synchronized: epoch_ms=%" PRIu64,
-             (uint64_t)tv->tv_sec * 1000ULL + (uint64_t)tv->tv_usec / 1000ULL);
-}
-
-static esp_err_t app_start_sntp(void)
-{
-    esp_sntp_config_t config =
-        ESP_NETIF_SNTP_DEFAULT_CONFIG(CONFIG_P4_INFERENCE_SNTP_SERVER);
-    config.sync_cb = app_sntp_sync_callback;
-
-    esp_err_t ret = esp_netif_sntp_init(&config);
-    if (ret == ESP_OK) {
-        ESP_LOGI(TAG, "SNTP started with server '%s'", CONFIG_P4_INFERENCE_SNTP_SERVER);
-    }
-    return ret;
-}
-#endif
-
-static uint64_t app_capture_epoch_ms(void)
-{
-#if CONFIG_P4_INFERENCE_SNTP_ENABLE
-    if (!s_time_synchronized) {
-        return 0;
-    }
-
-    struct timeval now;
-    if (gettimeofday(&now, NULL) != 0 ||
-        (int64_t)now.tv_sec < APP_MIN_VALID_EPOCH_SECONDS) {
-        return 0;
-    }
-    return (uint64_t)now.tv_sec * 1000ULL + (uint64_t)now.tv_usec / 1000ULL;
-#else
-    return 0;
-#endif
-}
 
 static void app_tune_task_wdt(void)
 {
@@ -677,9 +624,10 @@ static void run_periodic_inference(web_cam_t *wc, uint8_t *crop_rgb565)
         return;
     }
     /* This fresh buffer was produced after the dequeue request. Timestamp it
-     * before inference so Mesh congestion and encoding time cannot shift the
-     * event's capture time. Zero explicitly means SNTP is not synchronized. */
-    detected_at_ms = app_capture_epoch_ms();
+     * before inference using the server-authoritative clock exchanged through
+     * C6. Mesh congestion and JPEG encoding therefore cannot shift capture
+     * time. Zero explicitly means no fresh server time mapping is available. */
+    detected_at_ms = sdio_frame_tx_capture_time_ms();
 
     const size_t required_rgb565_size = (size_t)wc->width * wc->height * 2U;
     if (wc->pixel_format != EXAMPLE_VIDEO_FMT_RGB565 ||
@@ -1051,28 +999,24 @@ void app_main(void)
      */
     app_wait_for_video_init();
 
-    ESP_ERROR_CHECK(esp_netif_init());
+    /* ESP-Hosted transport events use the default event loop even when the
+     * optional HTTP/network path is disabled.  Creating this loop does not
+     * start Wi-Fi/Ethernet or wait for an IP address. */
     ESP_ERROR_CHECK(esp_event_loop_create_default());
+
+#if CONFIG_P4_ENABLE_HTTP
+    ESP_ERROR_CHECK(esp_netif_init());
 
     initialise_mdns();
     netbiosns_init();
     netbiosns_set_name(EXAMPLE_MDNS_HOST_NAME);
 
-    /* This helper function configures Wi-Fi or Ethernet, as selected in menuconfig.
-     * Read "Establishing Wi-Fi or Ethernet Connection" section in
-     * examples/protocols/README.md for more information about this function.
-     */
+    /* The diagnostic HTTP server is the only P4 feature that needs a
+     * network interface.  The autonomous inference/SDIO path intentionally
+     * does not wait for Ethernet or Wi-Fi. */
     ESP_ERROR_CHECK(example_connect());
-
-#if CONFIG_P4_INFERENCE_SNTP_ENABLE
-    esp_err_t sntp_ret = app_start_sntp();
-    if (sntp_ret != ESP_OK) {
-        ESP_LOGW(TAG,
-                 "SNTP initialization failed: %s; detection timestamps stay zero until reboot",
-                 esp_err_to_name(sntp_ret));
-    }
 #else
-    ESP_LOGW(TAG, "SNTP disabled; detection timestamps are sent as zero");
+    ESP_LOGI(TAG, "P4 HTTP disabled; skipping Ethernet/Wi-Fi connection");
 #endif
 
     int video_cam_fd = app_video_open(CAM_DEV_PATH, EXAMPLE_VIDEO_FMT_RGB565);
@@ -1087,7 +1031,11 @@ void app_main(void)
         ESP_LOGW(TAG, "Failed to start optional SDIO frame sender: %s", esp_err_to_name(sdio_ret));
     }
     web_cam_t *web_cam = NULL;
+#if CONFIG_P4_ENABLE_HTTP
     ESP_ERROR_CHECK(start_cam_web_server(index, video_cam_fd, &web_cam));
+#else
+    ESP_ERROR_CHECK(new_web_cam(video_cam_fd, &web_cam));
+#endif
     ESP_ERROR_CHECK(start_periodic_inference(web_cam));
     ESP_LOGI(TAG, "automatic inference scheduled every %u ms", AUTO_INFER_PERIOD_MS);
     ESP_LOGI(TAG, "Example Start");

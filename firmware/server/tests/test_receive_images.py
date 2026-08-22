@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 from pathlib import Path
 import struct
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 sys.dont_write_bytecode = True
@@ -76,6 +78,7 @@ class StreamParserTest(unittest.TestCase):
         self.assertEqual([r.header.sequence for r in records], [1, 2])
         self.assertEqual(records[0].jpeg, jpeg(b"one"))
         self.assertEqual(records[1].header.source_addr, 3)
+        self.assertEqual(records[1].header.device_id, 2)
         self.assertEqual(b"".join(logs), before + middle + after)
         self.assertEqual(events, [])
 
@@ -243,6 +246,46 @@ class StreamParserTest(unittest.TestCase):
         self.assertIn("src=0x0003", warning)
 
 
+class ConsoleLogWriterTest(unittest.TestCase):
+    def test_invalid_utf8_boot_bytes_are_safe_on_cp949_stdout(self) -> None:
+        raw_output = io.BytesIO()
+        cp949_stdout = io.TextIOWrapper(
+            raw_output, encoding="cp949", errors="strict", newline="",
+            write_through=True
+        )
+        writer = receive_images.ConsoleLogWriter()
+
+        with mock.patch.object(sys, "stdout", cp949_stdout):
+            writer.write(b"\xffI booted\n")
+
+        self.assertEqual(
+            raw_output.getvalue().decode("cp949"), "\\xffI booted\n"
+        )
+
+    def test_invalid_boot_bytes_around_jpeg_stay_cp949_safe(self) -> None:
+        image = jpeg(b"payload" + receive_images.MAGIC + b"\x80")
+        wire = b"\xffROM\n" + frame(image, sequence=23) + b"\xfeAPP\n"
+        raw_output = io.BytesIO()
+        cp949_stdout = io.TextIOWrapper(
+            raw_output, encoding="cp949", errors="strict", newline="",
+            write_through=True
+        )
+        writer = receive_images.ConsoleLogWriter()
+        parser = receive_images.ImageStreamParser(log_callback=writer.write)
+
+        records = []
+        with mock.patch.object(sys, "stdout", cp949_stdout):
+            # Split both ordinary log bytes and the framed-record magic.
+            for offset in range(0, len(wire), 3):
+                records.extend(parser.feed(wire[offset:offset + 3]))
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0].jpeg, image)
+        self.assertEqual(
+            raw_output.getvalue().decode("cp949"), "\\xffROM\n\\xfeAPP\n"
+        )
+
+
 class ImageSinkTest(unittest.TestCase):
     def test_atomic_image_latest_and_metadata_outputs(self) -> None:
         image = jpeg(b"saved")
@@ -253,7 +296,9 @@ class ImageSinkTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory)
-            path, metadata = receive_images.ImageSink(output).save(parsed[0])
+            path, metadata = receive_images.ImageSink(
+                output, {0x22: "north_gate"}
+            ).save(parsed[0])
 
             self.assertEqual(path.read_bytes(), image)
             self.assertEqual((output / "latest.jpg").read_bytes(), image)
@@ -261,11 +306,31 @@ class ImageSinkTest(unittest.TestCase):
                 (output / "latest.json").read_text(encoding="utf-8")
             )
             self.assertEqual(latest["source_addr_hex"], "0x0023")
+            self.assertEqual(latest["device_id"], 0x22)
+            self.assertEqual(latest["location"], "north_gate")
             self.assertEqual(latest["time_source"], "RX_ESTIMATE")
             self.assertEqual(latest["sequence"], 99)
             self.assertEqual(metadata, latest)
             self.assertTrue((output / path.with_suffix(".json").name).is_file())
             self.assertFalse(list(output.glob("*.tmp")))
+
+    def test_location_file_accepts_text_and_name_object(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "locations.json"
+            path.write_text(
+                json.dumps({"1": "front", "0x2": {"name": "storage"}}),
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                receive_images.load_locations(path),
+                {1: "front", 2: "storage"},
+            )
+
+    def test_invalid_mesh_source_address_is_rejected(self) -> None:
+        events = []
+        parser = receive_images.ImageStreamParser(events.append)
+        self.assertEqual(parser.feed(frame(jpeg(), source_addr=1)), [])
+        self.assertTrue(any("managed C6" in event.message for event in events))
 
 
 if __name__ == "__main__":

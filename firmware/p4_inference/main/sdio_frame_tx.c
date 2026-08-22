@@ -1,6 +1,7 @@
 #include "sdio_frame_tx.h"
 
 #include <inttypes.h>
+#include <limits.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
@@ -9,6 +10,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "sdkconfig.h"
+#include "sdio_time_clock.h"
 
 #if CONFIG_ESP_HOSTED_ENABLE_PEER_DATA_TRANSFER
 #include "esp_event.h"
@@ -41,18 +43,34 @@ static SemaphoreHandle_t s_state_lock;
 static bool s_hosted_initialized;
 static bool s_hosted_event_registered;
 static bool s_control_callback_registered;
+static bool s_time_callback_registered;
 static bool s_transport_up;
 static bool s_query_pending;
+static bool s_time_query_pending;
+static bool s_time_query_outstanding;
 static uint16_t s_remote_state = SDIO_FRAME_CONTROL_NOT_READY;
 static uint32_t s_active_frame_id;
 static bool s_active_frame_tx_complete;
 static uint32_t s_next_frame_id;
+static uint32_t s_next_time_request_id;
+static uint32_t s_time_request_id;
+static uint64_t s_time_client_tx_us;
+static int64_t s_next_time_query_us;
+static sdio_time_clock_t s_time_clock;
 static TickType_t s_next_reconnect_tick;
 static uint8_t s_reconnect_step;
 static esp_event_handler_instance_t s_hosted_event_instance;
 static const uint32_t s_reconnect_backoff_ms[SDIO_FRAME_TX_RECONNECT_STEPS] = {
     1000, 2000, 4000, 8000, 10000,
 };
+
+static void invalidate_time_locked(void)
+{
+    sdio_time_clock_invalidate(&s_time_clock);
+    s_time_query_outstanding = false;
+    s_time_request_id = 0;
+    s_time_client_tx_us = 0;
+}
 
 static const char *control_state_name(uint16_t state)
 {
@@ -88,6 +106,8 @@ static void state_mark_transport_down(void)
     s_active_frame_id = 0;
     s_active_frame_tx_complete = false;
     s_query_pending = false;
+    s_time_query_pending = false;
+    invalidate_time_locked();
     if (was_up || s_next_reconnect_tick == 0) {
         s_next_reconnect_tick =
             xTaskGetTickCount() + pdMS_TO_TICKS(s_reconnect_backoff_ms[0]);
@@ -107,6 +127,9 @@ static void state_mark_transport_up(void)
     s_active_frame_id = 0;
     s_active_frame_tx_complete = false;
     s_query_pending = true;
+    s_time_query_pending = false;
+    invalidate_time_locked();
+    s_next_time_query_us = 0;
     s_next_reconnect_tick = 0;
     s_reconnect_step = 0;
     xSemaphoreGive(s_state_lock);
@@ -166,6 +189,9 @@ static void hosted_event_handler(void *arg,
             s_active_frame_id = 0;
             s_active_frame_tx_complete = false;
             s_query_pending = s_transport_up;
+            s_time_query_pending = false;
+            invalidate_time_locked();
+            s_next_time_query_us = 0;
             xSemaphoreGive(s_state_lock);
         }
         ESP_LOGI(TAG, "C6 initialization event; readiness will be queried again");
@@ -212,12 +238,17 @@ static void control_message_callback(uint32_t msg_id, const uint8_t *data, size_
              */
             if (s_active_frame_id == 0) {
                 s_remote_state = control.state;
+                if (!s_time_clock.valid || s_next_time_query_us == 0) {
+                    s_time_query_pending = true;
+                }
                 accepted = true;
             }
             break;
         case SDIO_FRAME_CONTROL_NOT_READY:
             if (s_active_frame_id == 0) {
                 s_remote_state = control.state;
+                invalidate_time_locked();
+                s_time_query_pending = false;
                 accepted = true;
             } else if (control.frame_id == s_active_frame_id) {
                 /*
@@ -229,6 +260,8 @@ static void control_message_callback(uint32_t msg_id, const uint8_t *data, size_
                 s_active_frame_id = 0;
                 s_active_frame_tx_complete = false;
                 s_query_pending = true;
+                invalidate_time_locked();
+                s_time_query_pending = false;
                 accepted = true;
             }
             break;
@@ -295,6 +328,93 @@ static void control_message_callback(uint32_t msg_id, const uint8_t *data, size_
     }
 }
 
+static void time_message_callback(uint32_t msg_id,
+                                  const uint8_t *data,
+                                  size_t data_len)
+{
+    const int64_t client_rx_us = esp_timer_get_time();
+    if (msg_id != SDIO_TIME_MSG_ID || data == NULL ||
+        data_len != sizeof(sdio_time_message_t)) {
+        ESP_LOGW(TAG, "discarding malformed TIME message (%u B)",
+                 (unsigned int)data_len);
+        return;
+    }
+
+    sdio_time_message_t sample;
+    memcpy(&sample, data, sizeof(sample));
+    if (sample.magic != SDIO_TIME_MAGIC ||
+        sample.version != SDIO_FRAME_VERSION ||
+        sample.size != sizeof(sample) ||
+        sample.kind != SDIO_TIME_KIND_SAMPLE ||
+        sample.status < SDIO_TIME_STATUS_OK ||
+        sample.status > SDIO_TIME_STATUS_FAILED) {
+        ESP_LOGW(TAG,
+                 "discarding invalid TIME magic=%08" PRIx32
+                 " version=%u size=%u kind=%u status=%u",
+                 sample.magic, sample.version, sample.size,
+                 sample.kind, sample.status);
+        return;
+    }
+
+    sdio_time_apply_result_t result = SDIO_TIME_APPLY_STALE;
+    uint64_t measured_delay_us = 0;
+    bool matched = false;
+    if (s_state_lock != NULL &&
+        xSemaphoreTake(s_state_lock, portMAX_DELAY) == pdTRUE) {
+        if (s_time_query_outstanding) {
+            result = sdio_time_clock_apply_sample(
+                &s_time_clock, &sample, s_time_request_id,
+                s_time_client_tx_us, client_rx_us);
+            matched = result != SDIO_TIME_APPLY_STALE;
+        }
+
+        if (matched) {
+            s_time_query_outstanding = false;
+            s_time_request_id = 0;
+            s_time_client_tx_us = 0;
+            s_time_query_pending = false;
+
+            if (result == SDIO_TIME_APPLY_ACCEPTED) {
+                measured_delay_us = s_time_clock.measured_delay_us;
+                s_next_time_query_us =
+                    client_rx_us + SDIO_TIME_QUERY_INTERVAL_US;
+            } else if (result == SDIO_TIME_APPLY_REMOTE_STATUS &&
+                       sample.status == SDIO_TIME_STATUS_BUSY) {
+                /* BUSY is transient and does not discredit a still-fresh
+                 * previously accepted mapping. */
+                s_next_time_query_us =
+                    client_rx_us + SDIO_TIME_BUSY_RETRY_US;
+            } else {
+                sdio_time_clock_invalidate(&s_time_clock);
+                s_next_time_query_us =
+                    client_rx_us + SDIO_TIME_ERROR_RETRY_US;
+            }
+        }
+        xSemaphoreGive(s_state_lock);
+    }
+
+    if (!matched) {
+        ESP_LOGD(TAG,
+                 "ignored stale TIME sample request=%" PRIu32
+                 " client_tx=%" PRIu64,
+                 sample.request_id, sample.client_tx_monotonic_us);
+    } else if (result == SDIO_TIME_APPLY_ACCEPTED) {
+        ESP_LOGI(TAG,
+                 "server clock synchronized request=%" PRIu32
+                 " epoch_ms=%" PRIu64 " measured_delay=%" PRIu64 " us",
+                 sample.request_id,
+                 sdio_frame_tx_capture_time_ms(),
+                 measured_delay_us);
+    } else if (result == SDIO_TIME_APPLY_REMOTE_STATUS) {
+        ESP_LOGW(TAG, "server clock unavailable request=%" PRIu32
+                      " status=%u",
+                 sample.request_id, sample.status);
+    } else {
+        ESP_LOGW(TAG, "rejected inconsistent TIME sample request=%" PRIu32,
+                 sample.request_id);
+    }
+}
+
 static esp_err_t ensure_hosted_runtime(void)
 {
     esp_err_t ret;
@@ -330,13 +450,23 @@ static esp_err_t ensure_hosted_runtime(void)
         ESP_LOGI(TAG, "registered C6 control callback");
     }
 
+    if (!s_time_callback_registered) {
+        ret = esp_hosted_register_custom_callback(SDIO_TIME_MSG_ID,
+                                                  time_message_callback);
+        if (ret != ESP_OK) {
+            return ret;
+        }
+        s_time_callback_registered = true;
+        ESP_LOGI(TAG, "registered C6 server-clock callback");
+    }
+
     return ESP_OK;
 }
 
 static bool hosted_runtime_ready(void)
 {
     return s_hosted_event_registered && s_hosted_initialized &&
-           s_control_callback_registered;
+           s_control_callback_registered && s_time_callback_registered;
 }
 
 static esp_err_t send_control_query(void)
@@ -356,6 +486,71 @@ static esp_err_t send_control_query(void)
 
     esp_err_t ret = esp_hosted_send_custom_data(
         SDIO_FRAME_CONTROL_MSG_ID, (const uint8_t *)&query, sizeof(query));
+    if (ret != ESP_OK) {
+        state_mark_transport_down();
+    }
+    return ret;
+}
+
+static bool prepare_time_query(int64_t now_us, sdio_time_message_t *query)
+{
+    bool prepared = false;
+    if (query == NULL || s_state_lock == NULL ||
+        xSemaphoreTake(s_state_lock, portMAX_DELAY) != pdTRUE) {
+        return false;
+    }
+
+    if (s_time_query_outstanding &&
+        (now_us < 0 || s_time_client_tx_us > (uint64_t)INT64_MAX ||
+         now_us - (int64_t)s_time_client_tx_us >=
+             SDIO_TIME_QUERY_TIMEOUT_US)) {
+        ESP_LOGW(TAG, "server-clock query timed out request=%" PRIu32,
+                 s_time_request_id);
+        s_time_query_outstanding = false;
+        s_time_request_id = 0;
+        s_time_client_tx_us = 0;
+        s_next_time_query_us = now_us;
+    }
+
+    if (now_us >= 0 && s_transport_up && s_time_callback_registered &&
+        s_remote_state == SDIO_FRAME_CONTROL_READY &&
+        s_active_frame_id == 0 && !s_time_query_outstanding &&
+        (s_time_query_pending || s_next_time_query_us == 0 ||
+         now_us >= s_next_time_query_us)) {
+        do {
+            ++s_next_time_request_id;
+        } while (s_next_time_request_id == 0);
+
+        *query = (sdio_time_message_t) {
+            .magic = SDIO_TIME_MAGIC,
+            .version = SDIO_FRAME_VERSION,
+            .size = sizeof(*query),
+            .kind = SDIO_TIME_KIND_QUERY,
+            .status = SDIO_TIME_STATUS_NONE,
+            .request_id = s_next_time_request_id,
+            .client_tx_monotonic_us = (uint64_t)now_us,
+        };
+        s_time_query_outstanding = true;
+        s_time_query_pending = false;
+        s_time_request_id = query->request_id;
+        s_time_client_tx_us = query->client_tx_monotonic_us;
+        /* A response normally chooses the next deadline. This also prevents
+         * a tight retry loop if an unexpected callback clears the request. */
+        s_next_time_query_us = now_us + SDIO_TIME_QUERY_TIMEOUT_US;
+        prepared = true;
+    }
+
+    xSemaphoreGive(s_state_lock);
+    return prepared;
+}
+
+static esp_err_t send_time_query(const sdio_time_message_t *query)
+{
+    if (query == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    const esp_err_t ret = esp_hosted_send_custom_data(
+        SDIO_TIME_MSG_ID, (const uint8_t *)query, sizeof(*query));
     if (ret != ESP_OK) {
         state_mark_transport_down();
     }
@@ -563,6 +758,19 @@ static void sdio_frame_tx_worker(void *arg)
             }
         }
 
+        sdio_time_message_t time_query;
+        if (prepare_time_query(esp_timer_get_time(), &time_query)) {
+            esp_err_t ret = send_time_query(&time_query);
+            if (ret != ESP_OK) {
+                ESP_LOGW(TAG,
+                         "server-clock QUERY failed request=%" PRIu32 ": %s",
+                         time_query.request_id, esp_err_to_name(ret));
+            } else {
+                ESP_LOGD(TAG, "server-clock QUERY sent request=%" PRIu32,
+                         time_query.request_id);
+            }
+        }
+
         sdio_frame_tx_job_t *job = NULL;
         if (xQueueReceive(s_tx_queue,
                           &job,
@@ -624,6 +832,9 @@ esp_err_t sdio_frame_tx_init(void)
     }
 
     s_next_frame_id = (uint32_t)esp_timer_get_time();
+    s_next_time_request_id = s_next_frame_id ^ UINT32_C(0xa5c69e37);
+    s_next_time_query_us = 0;
+    sdio_time_clock_invalidate(&s_time_clock);
     if (xTaskCreate(sdio_frame_tx_worker,
                     "sdio_frame_tx",
                     SDIO_FRAME_TX_TASK_STACK_SIZE,
@@ -649,12 +860,38 @@ bool sdio_frame_tx_remote_ready(void)
     bool ready = false;
     if (s_state_lock != NULL && xSemaphoreTake(s_state_lock, portMAX_DELAY) == pdTRUE) {
         ready = s_transport_up && s_remote_state == SDIO_FRAME_CONTROL_READY &&
-                s_active_frame_id == 0;
+                s_active_frame_id == 0 && !s_time_query_outstanding;
         xSemaphoreGive(s_state_lock);
     }
     return ready;
 #else
     return false;
+#endif
+}
+
+uint64_t sdio_frame_tx_capture_time_ms(void)
+{
+#if CONFIG_ESP_HOSTED_ENABLE_PEER_DATA_TRANSFER
+    uint64_t epoch_ms = 0;
+    const int64_t now_us = esp_timer_get_time();
+    if (s_state_lock != NULL &&
+        xSemaphoreTake(s_state_lock, portMAX_DELAY) == pdTRUE) {
+        epoch_ms = sdio_time_clock_now_ms(&s_time_clock, now_us);
+        if (epoch_ms == 0 && s_time_clock.valid) {
+            /* Expiration is a hard validity boundary. Keep the old numeric
+             * anchor out of later captures and request a fresh server sample. */
+            sdio_time_clock_invalidate(&s_time_clock);
+            s_time_query_pending = s_transport_up &&
+                                   s_remote_state == SDIO_FRAME_CONTROL_READY &&
+                                   s_active_frame_id == 0 &&
+                                   !s_time_query_outstanding;
+            s_next_time_query_us = now_us;
+        }
+        xSemaphoreGive(s_state_lock);
+    }
+    return epoch_ms;
+#else
+    return 0;
 #endif
 }
 
@@ -691,7 +928,7 @@ esp_err_t sdio_frame_tx_submit_event(const uint8_t *jpeg,
         return ESP_ERR_TIMEOUT;
     }
     if (!s_transport_up || s_remote_state != SDIO_FRAME_CONTROL_READY ||
-        s_active_frame_id != 0) {
+        s_active_frame_id != 0 || s_time_query_outstanding) {
         xSemaphoreGive(s_state_lock);
         free_job(job);
         return ESP_ERR_INVALID_STATE;

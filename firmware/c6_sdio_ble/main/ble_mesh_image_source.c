@@ -6,6 +6,8 @@
 
 #include "sdkconfig.h"
 
+#include "device_identity.h"
+
 #include "esp_log.h"
 #include "esp_random.h"
 #include "esp_system.h"
@@ -51,11 +53,16 @@
 #define MESH_OPCODE_NACK       MESH_OPCODE(BLE_MESH_IMAGE_OP_NACK)
 #define MESH_OPCODE_RESTART    MESH_OPCODE(BLE_MESH_IMAGE_OP_RESTART)
 #define MESH_OPCODE_REJECT     MESH_OPCODE(BLE_MESH_IMAGE_OP_REJECT)
+#define MESH_OPCODE_TIME_REQUEST MESH_OPCODE(BLE_MESH_IMAGE_OP_TIME_REQUEST)
+#define MESH_OPCODE_TIME_STATUS  MESH_OPCODE(BLE_MESH_IMAGE_OP_TIME_STATUS)
 
 #define IMAGE_WORKER_STACK_BYTES       6144U
 #define IMAGE_WORKER_PRIORITY          5U
+/* The public model-send completion reports enqueue, not lower-transport
+ * completion. A following segmented DATA message can therefore receive
+ * -EBUSY while the previous same-destination transfer is still in flight. */
 #define LOCAL_SEND_TIMEOUT_MS          10000U
-#define LOCAL_SEND_RETRIES             5U
+#define LOCAL_SEND_RETRIES             80U
 #define ENQUEUE_RETRY_DELAY_MS         100U
 #define BUSY_RETRY_DELAY_MS            250U
 #define RESPONSE_TIMEOUT_MS            5000U
@@ -63,6 +70,9 @@
 #define REPAIR_ROUNDS                  5U
 #define SESSION_RESTARTS               5U
 #define FRAME_DEADLINE_US              (300LL * 1000LL * 1000LL)
+#define TIME_REQUEST_DEADLINE_US       \
+    ((int64_t)RESPONSE_TIMEOUT_MS * 1000LL)
+#define SERVER_TIME_MIN_UNIX_MS        UINT64_C(1704067200000)
 #define BT_SYNC_TIMEOUT_MS             10000U
 #define TRANSPORT_RESTART_DELAY_MS     2000U
 
@@ -71,8 +81,24 @@
 #define BINDING_NVS_APP_KEY            "app_idx"
 #define KEY_INDEX_MAX                  0x0FFFU
 #define APP_NET_CACHE_ENTRIES          16U
+#define C6_DEVICE_ID_MIN               1U
+#define C6_DEVICE_ID_MAX               32766U
+#define C6_EXPECTED_UNICAST_ADDR        ((uint16_t)(C6_DEVICE_ID + 1U))
+#define DEVICE_UUID_PREFIX_0            0x32U
+#define DEVICE_UUID_PREFIX_1            0x10U
+#define DEVICE_UUID_BT_ADDR_OFFSET      2U
+#define DEVICE_UUID_BT_ADDR_BYTES       6U
+#define DEVICE_UUID_ID_OFFSET           8U
+#define DEVICE_UUID_RESERVED_OFFSET     10U
 #define NACK_BITMAP_BYTES \
     ((BLE_MESH_IMAGE_MAX_CHUNKS + 7U) / 8U)
+
+_Static_assert(C6_DEVICE_ID >= C6_DEVICE_ID_MIN,
+               "C6_DEVICE_ID must not use the legacy/unset ID 0");
+_Static_assert(C6_DEVICE_ID <= C6_DEVICE_ID_MAX,
+               "C6_DEVICE_ID + 1 must remain a Mesh unicast address");
+_Static_assert(DEVICE_UUID_RESERVED_OFFSET <= ESP_BLE_MESH_OCTET16_LEN,
+               "C6 Device UUID layout exceeds the 16-byte Mesh UUID");
 
 typedef struct {
     const uint8_t *jpeg;
@@ -83,6 +109,24 @@ typedef struct {
     uint16_t ble_frame_id;
 } image_job_t;
 
+typedef struct {
+    uint32_t request_id;
+    uint64_t client_tx_monotonic_us;
+} time_job_t;
+
+typedef enum {
+    WORKER_JOB_IMAGE = 0,
+    WORKER_JOB_TIME,
+} worker_job_kind_t;
+
+typedef struct {
+    worker_job_kind_t kind;
+    union {
+        image_job_t image;
+        time_job_t time;
+    } value;
+} worker_job_t;
+
 typedef enum {
     RESPONSE_NONE = 0,
     RESPONSE_ACCEPT,
@@ -92,6 +136,13 @@ typedef enum {
     RESPONSE_RESTART,
     RESPONSE_REJECT,
 } gateway_response_t;
+
+typedef struct {
+    bool received;
+    bool available;
+    uint64_t server_rx_unix_ms;
+    uint64_t server_tx_unix_ms;
+} time_response_t;
 
 typedef struct {
     uint16_t net_idx;
@@ -114,7 +165,53 @@ typedef struct {
     uint16_t net_idx;
 } app_net_entry_t;
 
-static uint8_t s_dev_uuid[ESP_BLE_MESH_OCTET16_LEN] = {0x32, 0x10};
+static uint8_t s_dev_uuid[ESP_BLE_MESH_OCTET16_LEN];
+
+static void build_device_uuid(const uint8_t bt_addr[DEVICE_UUID_BT_ADDR_BYTES])
+{
+    memset(s_dev_uuid, 0, sizeof(s_dev_uuid));
+    s_dev_uuid[0] = DEVICE_UUID_PREFIX_0;
+    s_dev_uuid[1] = DEVICE_UUID_PREFIX_1;
+    memcpy(s_dev_uuid + DEVICE_UUID_BT_ADDR_OFFSET, bt_addr,
+           DEVICE_UUID_BT_ADDR_BYTES);
+    s_dev_uuid[DEVICE_UUID_ID_OFFSET] =
+        (uint8_t)((uint16_t)C6_DEVICE_ID & 0xFFU);
+    s_dev_uuid[DEVICE_UUID_ID_OFFSET + 1U] =
+        (uint8_t)(((uint16_t)C6_DEVICE_ID >> 8U) & 0xFFU);
+}
+
+static uint16_t device_uuid_id(void)
+{
+    return (uint16_t)s_dev_uuid[DEVICE_UUID_ID_OFFSET] |
+           ((uint16_t)s_dev_uuid[DEVICE_UUID_ID_OFFSET + 1U] << 8U);
+}
+
+static bool device_uuid_matches_configuration(void)
+{
+    if (s_dev_uuid[0] != DEVICE_UUID_PREFIX_0 ||
+        s_dev_uuid[1] != DEVICE_UUID_PREFIX_1 ||
+        device_uuid_id() != (uint16_t)C6_DEVICE_ID) {
+        return false;
+    }
+    for (size_t i = DEVICE_UUID_RESERVED_OFFSET; i < sizeof(s_dev_uuid); ++i) {
+        if (s_dev_uuid[i] != 0U) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void log_device_identity(void)
+{
+    ESP_LOGI(TAG,
+             "device_id=%" PRIu16 " requested_unicast=0x%04" PRIx16
+             " uuid=%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
+             device_uuid_id(), C6_EXPECTED_UNICAST_ADDR,
+             s_dev_uuid[0], s_dev_uuid[1], s_dev_uuid[2], s_dev_uuid[3],
+             s_dev_uuid[4], s_dev_uuid[5], s_dev_uuid[6], s_dev_uuid[7],
+             s_dev_uuid[8], s_dev_uuid[9], s_dev_uuid[10], s_dev_uuid[11],
+             s_dev_uuid[12], s_dev_uuid[13], s_dev_uuid[14], s_dev_uuid[15]);
+}
 
 static esp_ble_mesh_cfg_srv_t s_config_server = {
     /* Segmented unicast already repairs missing Lower Transport segments. */
@@ -152,6 +249,8 @@ static esp_ble_mesh_model_op_t s_vendor_ops[] = {
                           sizeof(ble_mesh_image_frame_t)),
     ESP_BLE_MESH_MODEL_OP(MESH_OPCODE_REJECT,
                           sizeof(ble_mesh_image_reject_t)),
+    ESP_BLE_MESH_MODEL_OP(MESH_OPCODE_TIME_STATUS,
+                          sizeof(ble_mesh_time_status_message_t)),
     ESP_BLE_MESH_MODEL_OP_END,
 };
 
@@ -217,6 +316,14 @@ static uint8_t s_nack_bitmap[NACK_BITMAP_BYTES];
 static gateway_response_t s_gateway_response;
 static uint8_t s_reject_reason;
 
+static bool s_time_active;
+static uint32_t s_active_time_request_id;
+static uint16_t s_active_time_net_idx = ESP_BLE_MESH_KEY_UNUSED;
+static uint16_t s_active_time_app_idx = ESP_BLE_MESH_KEY_UNUSED;
+static uint16_t s_active_time_destination;
+static uint32_t s_active_time_binding_generation;
+static time_response_t s_time_response;
+
 static app_net_entry_t s_app_net_cache[APP_NET_CACHE_ENTRIES];
 
 #if defined(CONFIG_BT_NIMBLE_ENABLED)
@@ -227,7 +334,7 @@ static esp_err_t s_bt_sync_result = ESP_FAIL;
 void ble_store_config_init(void);
 #endif
 
-static void image_worker(void *arg);
+static void source_worker(void *arg);
 static void refresh_ready_state(void);
 
 void __attribute__((weak)) ble_mesh_image_source_ready_changed(bool ready)
@@ -240,6 +347,22 @@ void __attribute__((weak)) ble_mesh_image_source_frame_done(
 {
     (void)p4_frame_id;
     (void)ble_frame_id;
+    (void)status;
+}
+
+void __attribute__((weak)) ble_mesh_image_source_time_done(
+    uint32_t request_id,
+    uint64_t client_tx_monotonic_us,
+    bool available,
+    uint64_t server_rx_unix_ms,
+    uint64_t server_tx_unix_ms,
+    esp_err_t status)
+{
+    (void)request_id;
+    (void)client_tx_monotonic_us;
+    (void)available;
+    (void)server_rx_unix_ms;
+    (void)server_tx_unix_ms;
     (void)status;
 }
 
@@ -280,9 +403,11 @@ static void refresh_ready_state(void)
 {
     bool ready;
     const bool provisioned = esp_ble_mesh_node_is_provisioned();
+    const bool expected_address =
+        s_elements[0].element_addr == C6_EXPECTED_UNICAST_ADDR;
 
     portENTER_CRITICAL(&s_state_lock);
-    ready = s_initialized && provisioned && s_mesh_bound &&
+    ready = s_initialized && provisioned && expected_address && s_mesh_bound &&
             s_transport_healthy &&
             s_image_publication.publish_addr >= 0x0001U &&
             s_image_publication.publish_addr <= 0x7fffU &&
@@ -309,6 +434,42 @@ static void publish_frame_done(const image_job_t *job, esp_err_t status)
                                      status);
     if (callback != NULL) {
         callback(job->p4_frame_id, job->ble_frame_id, status, callback_ctx);
+    }
+}
+
+static void publish_time_done(const time_job_t *job,
+                              const time_response_t *response,
+                              esp_err_t status)
+{
+    ble_mesh_image_source_time_done_cb_t callback;
+    void *callback_ctx;
+    const bool available = status == ESP_OK && response != NULL &&
+                           response->received && response->available;
+    const uint64_t server_rx_unix_ms =
+        available ? response->server_rx_unix_ms : 0U;
+    const uint64_t server_tx_unix_ms =
+        available ? response->server_tx_unix_ms : 0U;
+
+    portENTER_CRITICAL(&s_state_lock);
+    s_outstanding = false;
+    callback = s_callbacks.time_done;
+    callback_ctx = s_callback_ctx;
+    portEXIT_CRITICAL(&s_state_lock);
+
+    ble_mesh_image_source_time_done(job->request_id,
+                                    job->client_tx_monotonic_us,
+                                    available,
+                                    server_rx_unix_ms,
+                                    server_tx_unix_ms,
+                                    status);
+    if (callback != NULL) {
+        callback(job->request_id,
+                 job->client_tx_monotonic_us,
+                 available,
+                 server_rx_unix_ms,
+                 server_tx_unix_ms,
+                 status,
+                 callback_ctx);
     }
 }
 
@@ -572,9 +733,18 @@ static void provisioning_callback(esp_ble_mesh_prov_cb_event_t event,
                  param->prov_register_comp.err_code);
         break;
     case ESP_BLE_MESH_NODE_PROV_COMPLETE_EVT:
-        ESP_LOGI(TAG, "provisioned net=0x%03x addr=0x%04x",
+        ESP_LOGI(TAG,
+                 "provisioned net=0x%03x addr=0x%04x expected=0x%04x",
                  param->node_prov_complete.net_idx,
-                 param->node_prov_complete.addr);
+                 param->node_prov_complete.addr,
+                 C6_EXPECTED_UNICAST_ADDR);
+        if (param->node_prov_complete.addr != C6_EXPECTED_UNICAST_ADDR) {
+            ESP_LOGE(TAG,
+                     "unexpected Mesh address for device_id=%u; READY is "
+                     "blocked, reset this node and provision it with the "
+                     "firmware/server Gateway",
+                     (unsigned)C6_DEVICE_ID);
+        }
         refresh_ready_state();
         break;
     case ESP_BLE_MESH_NODE_PROV_RESET_EVT:
@@ -954,6 +1124,11 @@ static esp_err_t send_mesh_message(uint32_t opcode,
             }
             last_error = completion_result;
             if (attempt < LOCAL_SEND_RETRIES) {
+                ESP_LOGW(TAG,
+                         "model-send busy (segmented TX still active) "
+                         "attempt %u/%u; retry in %u ms",
+                         attempt, LOCAL_SEND_RETRIES,
+                         BUSY_RETRY_DELAY_MS);
                 vTaskDelay(pdMS_TO_TICKS(BUSY_RETRY_DELAY_MS));
             }
             continue;
@@ -1031,6 +1206,85 @@ static esp_err_t send_end(const image_job_t *job,
     ble_mesh_image_put_le16(packet, job->ble_frame_id);
     return send_mesh_message(MESH_OPCODE_END, packet, sizeof(packet), route,
                              deadline_us);
+}
+
+static esp_err_t send_time_request(const time_job_t *job,
+                                   const mesh_route_t *route,
+                                   int64_t deadline_us)
+{
+    uint8_t packet[sizeof(ble_mesh_time_request_t)];
+    ble_mesh_image_put_le32(packet, job->request_id);
+    return send_mesh_message(MESH_OPCODE_TIME_REQUEST, packet, sizeof(packet),
+                             route, deadline_us);
+}
+
+static void begin_active_time(const time_job_t *job,
+                              const mesh_route_t *route)
+{
+    while (xSemaphoreTake(s_response_sem, 0) == pdTRUE) {
+    }
+
+    portENTER_CRITICAL(&s_state_lock);
+    s_time_active = true;
+    s_active_time_request_id = job->request_id;
+    s_active_time_net_idx = route->net_idx;
+    s_active_time_app_idx = route->app_idx;
+    s_active_time_destination = route->destination;
+    s_active_time_binding_generation = route->binding_generation;
+    memset(&s_time_response, 0, sizeof(s_time_response));
+    portEXIT_CRITICAL(&s_state_lock);
+}
+
+static void end_active_time(void)
+{
+    portENTER_CRITICAL(&s_state_lock);
+    s_time_active = false;
+    s_active_time_request_id = 0U;
+    s_active_time_net_idx = ESP_BLE_MESH_KEY_UNUSED;
+    s_active_time_app_idx = ESP_BLE_MESH_KEY_UNUSED;
+    s_active_time_destination = 0U;
+    s_active_time_binding_generation = 0U;
+    memset(&s_time_response, 0, sizeof(s_time_response));
+    portEXIT_CRITICAL(&s_state_lock);
+
+    while (xSemaphoreTake(s_response_sem, 0) == pdTRUE) {
+    }
+}
+
+static esp_err_t query_server_time(const time_job_t *job,
+                                   time_response_t *response)
+{
+    if (job == NULL || response == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    mesh_route_t route;
+    if (!snapshot_route(&route)) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    const int64_t deadline_us = esp_timer_get_time() +
+                                TIME_REQUEST_DEADLINE_US;
+    begin_active_time(job, &route);
+    esp_err_t err = send_time_request(job, &route, deadline_us);
+    if (err == ESP_OK) {
+        (void)xSemaphoreTake(s_response_sem,
+                             response_wait_ticks(deadline_us));
+        portENTER_CRITICAL(&s_state_lock);
+        *response = s_time_response;
+        portEXIT_CRITICAL(&s_state_lock);
+        if (!response->received) {
+            err = ESP_ERR_TIMEOUT;
+        }
+    }
+    end_active_time();
+
+    ESP_LOGI(TAG,
+             "server-time request=%" PRIu32 " available=%u status=%s",
+             job->request_id,
+             response->received && response->available ? 1U : 0U,
+             esp_err_to_name(err));
+    return err;
 }
 
 static void begin_active_frame(const image_job_t *job,
@@ -1333,19 +1587,94 @@ static esp_err_t send_image(const image_job_t *job)
     return err;
 }
 
-static void image_worker(void *arg)
+static void source_worker(void *arg)
 {
     (void)arg;
-    image_job_t job;
+    worker_job_t job;
 
     for (;;) {
         if (xQueueReceive(s_job_queue, &job, portMAX_DELAY) != pdTRUE) {
             continue;
         }
-        esp_err_t err = send_image(&job);
-        publish_frame_done(&job, err);
+        if (job.kind == WORKER_JOB_IMAGE) {
+            esp_err_t err = send_image(&job.value.image);
+            publish_frame_done(&job.value.image, err);
+        } else if (job.kind == WORKER_JOB_TIME) {
+            time_response_t response = {0};
+            esp_err_t err = query_server_time(&job.value.time, &response);
+            publish_time_done(&job.value.time, &response, err);
+        } else {
+            portENTER_CRITICAL(&s_state_lock);
+            s_outstanding = false;
+            portEXIT_CRITICAL(&s_state_lock);
+            ESP_LOGE(TAG, "discarded unknown worker job kind=%u",
+                     (unsigned int)job.kind);
+        }
         restart_after_transport_fault();
     }
+}
+
+static bool handle_time_status_message(const uint8_t *message,
+                                       size_t length,
+                                       const esp_ble_mesh_msg_ctx_t *ctx)
+{
+    if (message == NULL || ctx == NULL ||
+        length != sizeof(ble_mesh_time_status_message_t)) {
+        ESP_LOGW(TAG, "discard malformed TIME_STATUS len=%u",
+                 (unsigned int)length);
+        return false;
+    }
+
+    const uint32_t request_id = ble_mesh_image_get_le32(message);
+    const uint8_t status = message[4];
+    const bool reserved_zero = message[5] == 0U && message[6] == 0U &&
+                               message[7] == 0U;
+    const uint64_t server_rx_unix_ms = ble_mesh_image_get_le64(message + 8U);
+    const uint64_t server_tx_unix_ms = ble_mesh_image_get_le64(message + 16U);
+    const bool available = status == BLE_MESH_TIME_STATUS_OK;
+    const bool valid_status = available ||
+                              status == BLE_MESH_TIME_STATUS_UNAVAILABLE;
+    const bool valid_timestamps =
+        (available && server_rx_unix_ms >= SERVER_TIME_MIN_UNIX_MS &&
+         server_tx_unix_ms >= server_rx_unix_ms) ||
+        (!available && server_rx_unix_ms == 0U && server_tx_unix_ms == 0U);
+
+    if (!reserved_zero || !valid_status || !valid_timestamps) {
+        ESP_LOGW(TAG,
+                 "discard invalid TIME_STATUS request=%" PRIu32
+                 " status=%u rx=%" PRIu64 " tx=%" PRIu64,
+                 request_id, status, server_rx_unix_ms, server_tx_unix_ms);
+        return false;
+    }
+
+    bool accepted = false;
+    portENTER_CRITICAL(&s_state_lock);
+    if (s_time_active && s_ready &&
+        request_id == s_active_time_request_id &&
+        s_active_time_binding_generation == s_binding_generation &&
+        ctx->addr == s_active_time_destination &&
+        ctx->net_idx == s_active_time_net_idx &&
+        ctx->app_idx == s_active_time_app_idx &&
+        !s_time_response.received) {
+        s_time_response.received = true;
+        s_time_response.available = available;
+        s_time_response.server_rx_unix_ms = server_rx_unix_ms;
+        s_time_response.server_tx_unix_ms = server_tx_unix_ms;
+        accepted = true;
+    }
+    portEXIT_CRITICAL(&s_state_lock);
+
+    if (!accepted) {
+        ESP_LOGW(TAG,
+                 "discard stale/foreign TIME_STATUS request=%" PRIu32
+                 " source=0x%04x",
+                 request_id, ctx->addr);
+        return false;
+    }
+    if (s_response_sem != NULL) {
+        xSemaphoreGive(s_response_sem);
+    }
+    return true;
 }
 
 static void custom_model_callback(esp_ble_mesh_model_cb_event_t event,
@@ -1382,6 +1711,11 @@ static void custom_model_callback(esp_ble_mesh_model_cb_event_t event,
     const uint32_t opcode = param->model_operation.opcode;
     const uint8_t *message = param->model_operation.msg;
     const size_t length = param->model_operation.length;
+    if (opcode == MESH_OPCODE_TIME_STATUS) {
+        (void)handle_time_status_message(message, length,
+                                         param->model_operation.ctx);
+        return;
+    }
     gateway_response_t response = RESPONSE_NONE;
     uint8_t reject_reason = 0;
 
@@ -1536,7 +1870,7 @@ static esp_err_t local_bluetooth_init(void)
     if (s_bt_sync_result != ESP_OK) {
         return s_bt_sync_result;
     }
-    memcpy(s_dev_uuid + 2, s_bt_addr, sizeof(s_bt_addr));
+    build_device_uuid(s_bt_addr);
     return ESP_OK;
 }
 #elif defined(CONFIG_BT_BLUEDROID_ENABLED)
@@ -1559,7 +1893,7 @@ static esp_err_t local_bluetooth_init(void)
         err = esp_bluedroid_enable();
     }
     if (err == ESP_OK) {
-        memcpy(s_dev_uuid + 2, esp_bt_dev_get_address(), 6U);
+        build_device_uuid(esp_bt_dev_get_address());
     }
     return err;
 }
@@ -1573,7 +1907,7 @@ static esp_err_t local_bluetooth_init(void)
 
 static esp_err_t create_runtime_objects(void)
 {
-    s_job_queue = xQueueCreate(1, sizeof(image_job_t));
+    s_job_queue = xQueueCreate(1, sizeof(worker_job_t));
     s_send_done_sem = xSemaphoreCreateBinary();
     s_response_sem = xSemaphoreCreateBinary();
     if (s_job_queue == NULL || s_send_done_sem == NULL ||
@@ -1622,6 +1956,11 @@ esp_err_t ble_mesh_image_source_init(void)
     if (err != ESP_OK) {
         return fail_init(err);
     }
+    if (!device_uuid_matches_configuration()) {
+        ESP_LOGE(TAG, "invalid C6 Device UUID encoding");
+        return fail_init(ESP_ERR_INVALID_STATE);
+    }
+    log_device_identity();
 
     /* A fresh boot must not deterministically reuse BLE frame 1 while the
      * Gateway may still hold a short completed-frame cache. Per-frame NVS
@@ -1650,7 +1989,7 @@ esp_err_t ble_mesh_image_source_init(void)
         return fail_init(err);
     }
 
-    if (xTaskCreate(image_worker, "ble_img_worker",
+    if (xTaskCreate(source_worker, "ble_src_worker",
                     IMAGE_WORKER_STACK_BYTES, NULL,
                     IMAGE_WORKER_PRIORITY, &s_worker_task) != pdPASS) {
         return fail_init(ESP_ERR_NO_MEM);
@@ -1688,12 +2027,15 @@ esp_err_t ble_mesh_image_source_submit(const uint8_t *jpeg,
         return ESP_ERR_INVALID_SIZE;
     }
 
-    image_job_t job = {
-        .jpeg = jpeg,
-        .len = len,
-        .p4_frame_id = p4_frame_id,
-        .detected_at_ms = detected_at_ms,
-        .jpeg_crc32 = jpeg_crc32,
+    worker_job_t job = {
+        .kind = WORKER_JOB_IMAGE,
+        .value.image = {
+            .jpeg = jpeg,
+            .len = len,
+            .p4_frame_id = p4_frame_id,
+            .detected_at_ms = detected_at_ms,
+            .jpeg_crc32 = jpeg_crc32,
+        },
     };
 
     portENTER_CRITICAL(&s_state_lock);
@@ -1701,7 +2043,7 @@ esp_err_t ble_mesh_image_source_submit(const uint8_t *jpeg,
         portEXIT_CRITICAL(&s_state_lock);
         return ESP_ERR_INVALID_STATE;
     }
-    job.ble_frame_id = s_next_frame_id++;
+    job.value.image.ble_frame_id = s_next_frame_id++;
     if (s_next_frame_id == 0U) {
         s_next_frame_id = 1U;
     }
@@ -1716,7 +2058,39 @@ esp_err_t ble_mesh_image_source_submit(const uint8_t *jpeg,
     }
 
     if (ble_frame_id != NULL) {
-        *ble_frame_id = job.ble_frame_id;
+        *ble_frame_id = job.value.image.ble_frame_id;
+    }
+    return ESP_OK;
+}
+
+esp_err_t ble_mesh_image_source_request_time(
+    uint32_t request_id, uint64_t client_tx_monotonic_us)
+{
+    worker_job_t job = {
+        .kind = WORKER_JOB_TIME,
+        .value.time = {
+            .request_id = request_id,
+            .client_tx_monotonic_us = client_tx_monotonic_us,
+        },
+    };
+
+    portENTER_CRITICAL(&s_state_lock);
+    if (!s_initialized || !s_ready) {
+        portEXIT_CRITICAL(&s_state_lock);
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (s_outstanding) {
+        portEXIT_CRITICAL(&s_state_lock);
+        return ESP_ERR_NOT_FINISHED;
+    }
+    s_outstanding = true;
+    portEXIT_CRITICAL(&s_state_lock);
+
+    if (xQueueSend(s_job_queue, &job, 0) != pdTRUE) {
+        portENTER_CRITICAL(&s_state_lock);
+        s_outstanding = false;
+        portEXIT_CRITICAL(&s_state_lock);
+        return ESP_ERR_TIMEOUT;
     }
     return ESP_OK;
 }

@@ -54,8 +54,6 @@ CONFIG_WIFI_RMT_RX_BA_WIN=32
 # sender is driven only by the 30-second human monitor and paired c6_sdio_ble.
 # CONFIG_EXAMPLE_CONNECT_WIFI is not set
 CONFIG_EXAMPLE_CONNECT_ETHERNET=y
-
-# Absolute capture timestamps for SDIO image events. Set the server to a LAN
-# NTP address for deployments without Internet access.
-CONFIG_P4_INFERENCE_SNTP_ENABLE=y
-CONFIG_P4_INFERENCE_SNTP_SERVER="pool.ntp.org"
+# The autonomous inference path does not require a P4 network interface.
+# Enable P4_ENABLE_HTTP only for the optional diagnostic HTTP endpoints.
+# CONFIG_P4_ENABLE_HTTP is not set

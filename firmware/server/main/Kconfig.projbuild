@@ -24,16 +24,30 @@ menu "Mesh image server"
             chunk once after boot while an active matching frame exists, so
             the following END must produce a bitmap NACK.
 
-    config SERVER_HTTP_ENABLE
-        bool "Wi-Fi/SNTP latest-image HTTP adapter"
-        depends on SOC_WIFI_SUPPORTED && !SERVER_SERIAL_IMAGE_ENABLE
+    config SERVER_SERIAL_IMAGE_ENABLE
+        bool "Framed JPEG records on the console stream"
+        default y
+        help
+            Copy each completed Mesh JPEG into a fixed-capacity queue backed
+            by one internal-RAM slot preallocated during startup, and
+            transmit it atomically on the same stdout stream as text event
+            logs. Use the supplied PC receiver instead of idf.py monitor.
+            This image exporter is mutually exclusive with the HTTP exporter,
+            but it can run together with SERVER_WIFI_SNTP_ENABLE. A 921600-baud
+            console is recommended.
+
+    config SERVER_WIFI_SNTP_ENABLE
+        bool "Wi-Fi STA and persistent SNTP server clock"
+        depends on SOC_WIFI_SUPPORTED
         default n
         help
-            Optional adapter for Wi-Fi-capable targets. The Mesh core and
-            public callback API do not depend on Wi-Fi; ESP32-H2 excludes this
+            Connect a Wi-Fi-capable server to an access point and maintain its
+            Unix wall clock with SNTP. This is independent of the serial and
+            HTTP image exporters, so an ESP32-CAM can keep exporting JPEGs on
+            UART while it supplies time to C6 nodes. ESP32-H2 excludes this
             source entirely.
 
-    if SERVER_HTTP_ENABLE
+    if SERVER_WIFI_SNTP_ENABLE
 
         config SERVER_WIFI_SSID
             string "Wi-Fi SSID"
@@ -47,21 +61,36 @@ menu "Mesh image server"
             string "SNTP server"
             default "pool.ntp.org"
 
+        config SERVER_SNTP_MAX_AGE_MS
+            int "Maximum accepted SNTP clock age (milliseconds)"
+            range 60000 86400000
+            default 7200000
+            help
+                Stop advertising the wall clock as valid when this much
+                monotonic time has elapsed since the last successful SNTP
+                update. The two-hour default allows one missed hourly poll
+                without distributing a clock that has been offline forever.
+
+    endif
+
+    config SERVER_HTTP_ENABLE
+        bool "Latest-image HTTP adapter"
+        depends on SOC_WIFI_SUPPORTED && !SERVER_SERIAL_IMAGE_ENABLE
+        select SERVER_WIFI_SNTP_ENABLE
+        default n
+        help
+            Optional latest-image exporter for Wi-Fi-capable targets. Wi-Fi
+            STA and SNTP are owned by SERVER_WIFI_SNTP_ENABLE, avoiding a
+            second network stack initialization. ESP32-H2 excludes this
+            source entirely.
+
+    if SERVER_HTTP_ENABLE
+
         config SERVER_HTTP_PORT
             int "HTTP port"
             range 1 65535
             default 80
 
     endif
-
-    config SERVER_SERIAL_IMAGE_ENABLE
-        bool "Framed JPEG records on the console stream"
-        default y
-        help
-            Copy each completed Mesh JPEG into a fixed static queue and
-            transmit it atomically on the same stdout stream as text event
-            logs. Use the supplied PC receiver instead of idf.py monitor.
-            This option is mutually exclusive with the Wi-Fi/SNTP/HTTP
-            adapter. A 921600-baud console is recommended.
 
 endmenu

@@ -26,6 +26,8 @@ import zlib
 MAGIC = b"BMJPEG01"
 VERSION = 1
 MAX_JPEG_BYTES = 30_720
+SERVER_MESH_ADDR = 0x0001
+MAX_DEVICE_ID = 0x7FFE
 HEADER_STRUCT = struct.Struct("<8sHHHBBQIIII")
 HEADER_SIZE = HEADER_STRUCT.size
 HEADER_CRC_BYTES = HEADER_SIZE - 4
@@ -44,6 +46,7 @@ class RecordError(ValueError):
 @dataclass(frozen=True)
 class RecordHeader:
     source_addr: int
+    device_id: int
     time_source: int
     event_time_ms: int
     jpeg_len: int
@@ -69,6 +72,43 @@ def crc32(data: bytes) -> int:
     return zlib.crc32(data) & 0xFFFFFFFF
 
 
+def device_id_from_source(source_addr: int) -> int:
+    """Return the compile-time C6 ID encoded by deterministic provisioning."""
+
+    device_id = source_addr - SERVER_MESH_ADDR
+    if device_id < 1 or device_id > MAX_DEVICE_ID:
+        raise RecordError(
+            f"source address 0x{source_addr:04x} is not a managed C6 address"
+        )
+    return device_id
+
+
+def load_locations(path: Path) -> dict[int, str]:
+    """Load JSON such as {"1": "front-door", "2": "warehouse"}."""
+
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"cannot load locations file {path}: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise ValueError("locations JSON must be an object keyed by device ID")
+
+    result: dict[int, str] = {}
+    for raw_id, raw_location in raw.items():
+        try:
+            device_id = int(str(raw_id), 0)
+        except ValueError as exc:
+            raise ValueError(f"invalid device ID key {raw_id!r}") from exc
+        if device_id < 1 or device_id > MAX_DEVICE_ID:
+            raise ValueError(f"device ID {device_id} is outside 1..{MAX_DEVICE_ID}")
+        if isinstance(raw_location, dict):
+            raw_location = raw_location.get("name")
+        if not isinstance(raw_location, str) or not raw_location.strip():
+            raise ValueError(f"location for device ID {device_id} must be text")
+        result[device_id] = raw_location.strip()
+    return result
+
+
 def decode_header(wire: bytes) -> RecordHeader:
     if len(wire) != HEADER_SIZE:
         raise RecordError(f"header size {len(wire)} != {HEADER_SIZE}")
@@ -91,6 +131,7 @@ def decode_header(wire: bytes) -> RecordHeader:
         raise RecordError(f"invalid JPEG length {jpeg_len}")
     if sequence == 0:
         raise RecordError("invalid zero sequence")
+    device_id = device_id_from_source(source_addr)
 
     calculated = crc32(wire[:HEADER_CRC_BYTES])
     if calculated != header_crc32:
@@ -101,6 +142,7 @@ def decode_header(wire: bytes) -> RecordHeader:
 
     return RecordHeader(
         source_addr=source_addr,
+        device_id=device_id,
         time_source=time_source,
         event_time_ms=event_time_ms,
         jpeg_len=jpeg_len,
@@ -299,8 +341,10 @@ def _atomic_write(path: Path, data: bytes) -> None:
 
 
 class ImageSink:
-    def __init__(self, output: Path) -> None:
+    def __init__(self, output: Path,
+                 locations: Optional[dict[int, str]] = None) -> None:
         self.output = output
+        self.locations = dict(locations or {})
         self.output.mkdir(parents=True, exist_ok=True)
 
     def save(self, record: ImageRecord) -> tuple[Path, dict]:
@@ -312,8 +356,10 @@ class ImageSink:
             + f"{received_at_ms % 1000:03d}Z"
         )
         header = record.header
+        location = self.locations.get(header.device_id)
         stem = (
-            f"image_{received_tag}_src{header.source_addr:04x}_"
+            f"image_{received_tag}_id{header.device_id:04d}_"
+            f"src{header.source_addr:04x}_"
             f"seq{header.sequence:010d}"
         )
         image_path = self.output / f"{stem}.jpg"
@@ -322,6 +368,8 @@ class ImageSink:
         metadata = {
             "protocol": "BMJPEG01",
             "version": VERSION,
+            "device_id": header.device_id,
+            "location": location,
             "source_addr": header.source_addr,
             "source_addr_hex": f"0x{header.source_addr:04x}",
             "time_source": TIME_SOURCE_NAMES.get(
@@ -409,7 +457,15 @@ class ConsoleLogWriter:
     """Incrementally decode text split across arbitrary serial reads."""
 
     def __init__(self) -> None:
-        self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        # ESP32 ROM boot text is emitted at 115200 baud before the application
+        # switches to the configured 921600-baud console. Those initial bytes
+        # are therefore often invalid UTF-8. ``replace`` produces U+FFFD,
+        # which a strict Windows CP949 stdout cannot encode and used to stop
+        # the receiver. ASCII ``\\xNN`` escapes remain printable on every
+        # Windows console while preserving the offending byte values.
+        self._decoder = codecs.getincrementaldecoder("utf-8")(
+            errors="backslashreplace"
+        )
 
     def write(self, data: bytes) -> None:
         text = self._decoder.decode(data, final=False)
@@ -418,7 +474,8 @@ class ConsoleLogWriter:
             sys.stdout.flush()
 
 
-def receive_forever(port_name: str, baud: int, output: Path) -> int:
+def receive_forever(port_name: str, baud: int, output: Path,
+                    locations: Optional[dict[int, str]] = None) -> int:
     try:
         import serial  # type: ignore
     except ModuleNotFoundError:
@@ -441,7 +498,7 @@ def receive_forever(port_name: str, baud: int, output: Path) -> int:
         event_callback=_print_parser_event,
         log_callback=log_writer.write,
     )
-    sink = ImageSink(output)
+    sink = ImageSink(output, locations)
     sequences = SequenceTracker()
 
     def process_records(records: Iterable[ImageRecord]) -> None:
@@ -464,7 +521,9 @@ def receive_forever(port_name: str, baud: int, output: Path) -> int:
                 )
                 continue
             print(
-                f"IMAGE src={metadata['source_addr_hex']} "
+                f"IMAGE id={metadata['device_id']} "
+                f"location={metadata['location'] or '-'} "
+                f"src={metadata['source_addr_hex']} "
                 f"seq={metadata['sequence']} "
                 f"event_ms={metadata['event_time_ms']} "
                 f"time={metadata['time_source']} "
@@ -521,6 +580,10 @@ def _parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         "--output", type=Path, default=Path("received_images"),
         help="output directory (default: received_images)",
     )
+    parser.add_argument(
+        "--locations", type=Path,
+        help='optional JSON mapping of C6 IDs to locations, e.g. {"1":"entrance"}',
+    )
     args = parser.parse_args(argv)
     if args.baud <= 0:
         parser.error("--baud must be positive")
@@ -529,7 +592,12 @@ def _parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
 
 def main(argv: Optional[Iterable[str]] = None) -> int:
     args = _parse_args(argv)
-    return receive_forever(args.port, args.baud, args.output)
+    try:
+        locations = load_locations(args.locations) if args.locations else {}
+    except ValueError as exc:
+        print(exc, file=sys.stderr)
+        return 2
+    return receive_forever(args.port, args.baud, args.output, locations)
 
 
 if __name__ == "__main__":

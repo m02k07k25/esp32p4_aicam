@@ -38,6 +38,13 @@ extern "C" {
 #define BLE_MESH_IMAGE_OP_NACK             0xC7U
 #define BLE_MESH_IMAGE_OP_RESTART          0xC8U
 #define BLE_MESH_IMAGE_OP_REJECT           0xC9U
+#define BLE_MESH_IMAGE_OP_TIME_REQUEST     0xCAU
+#define BLE_MESH_IMAGE_OP_TIME_STATUS      0xCBU
+
+typedef enum {
+    BLE_MESH_TIME_STATUS_OK = 0,
+    BLE_MESH_TIME_STATUS_UNAVAILABLE = 1,
+} ble_mesh_time_status_code_t;
 
 typedef enum {
     BLE_MESH_IMAGE_REJECT_MALFORMED = 1,
@@ -79,6 +86,20 @@ typedef struct __attribute__((packed)) {
     uint16_t frame_id;
     uint8_t reason;
 } ble_mesh_image_reject_t;
+
+/* CA TIME_REQUEST: a client-generated nonce, exactly 4 bytes. */
+typedef struct __attribute__((packed)) {
+    uint32_t request_id;
+} ble_mesh_time_request_t;
+
+/* CB TIME_STATUS: exactly 24 bytes. Timestamps are Unix milliseconds. */
+typedef struct __attribute__((packed)) {
+    uint32_t request_id;
+    uint8_t status;
+    uint8_t reserved[3];
+    uint64_t server_rx_unix_ms;
+    uint64_t server_tx_unix_ms;
+} ble_mesh_time_status_message_t;
 
 /* Unaligned-safe little-endian codecs for radio callback buffers. */
 static inline uint16_t ble_mesh_image_get_le16(const uint8_t *value)
@@ -129,6 +150,10 @@ static_assert(sizeof(ble_mesh_image_nack_header_t) == 3U,
               "BLE image NACK prefix changed");
 static_assert(sizeof(ble_mesh_image_reject_t) == 3U,
               "BLE image REJECT wire layout changed");
+static_assert(sizeof(ble_mesh_time_request_t) == 4U,
+              "BLE time request wire layout changed");
+static_assert(sizeof(ble_mesh_time_status_message_t) == 24U,
+              "BLE time status wire layout changed");
 static_assert(BLE_MESH_IMAGE_MAX_CHUNKS == 83U,
               "BLE image chunk limit changed");
 static_assert(sizeof(ble_mesh_image_data_header_t) +
@@ -145,6 +170,10 @@ _Static_assert(sizeof(ble_mesh_image_nack_header_t) == 3U,
                "BLE image NACK prefix changed");
 _Static_assert(sizeof(ble_mesh_image_reject_t) == 3U,
                "BLE image REJECT wire layout changed");
+_Static_assert(sizeof(ble_mesh_time_request_t) == 4U,
+               "BLE time request wire layout changed");
+_Static_assert(sizeof(ble_mesh_time_status_message_t) == 24U,
+               "BLE time status wire layout changed");
 _Static_assert(BLE_MESH_IMAGE_MAX_CHUNKS == 83U,
                "BLE image chunk limit changed");
 _Static_assert(sizeof(ble_mesh_image_data_header_t) +

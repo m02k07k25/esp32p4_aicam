@@ -19,6 +19,7 @@ typedef enum {
 
 typedef struct {
     uint16_t source_addr;
+    uint16_t device_id;
     uint64_t event_time_ms;
     server_time_source_t time_source;
     const uint8_t *jpeg;
@@ -49,6 +50,13 @@ esp_err_t mesh_image_gateway_set_time_provider(
 
 /* True only while the single JPEG reassembly slot is active. */
 bool mesh_image_gateway_is_receiving(void);
+
+/*
+ * C6 installation IDs are compiled into the Device UUID.  The Provisioner
+ * assigns the deterministic primary address (device_id + 1), with 0x0001
+ * reserved for this Gateway.  Zero means that an address is not a managed C6.
+ */
+uint16_t mesh_image_gateway_device_id_from_addr(uint16_t source_addr);
 
 /*
  * Reserve an idle radio window for optional local I/O such as a JPEG HTTP

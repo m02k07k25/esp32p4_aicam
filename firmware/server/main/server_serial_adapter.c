@@ -11,6 +11,7 @@
 #include "mesh_image_gateway.h"
 
 #include "esp_crc.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
@@ -48,7 +49,14 @@ typedef struct {
     uint8_t jpeg[BLE_MESH_IMAGE_MAX_BYTES];
 } serial_image_slot_t;
 
-static serial_image_slot_t s_slots[SERIAL_SLOT_COUNT];
+/*
+ * Keep the 30 KiB transfer slot out of .dram0.bss. Wi-Fi, Bluetooth Mesh,
+ * and the fixed image reassembly buffer otherwise overflow ESP32's link-time
+ * DRAM region when serial output and SNTP are enabled together. This is one
+ * bounded allocation during startup; the completion callback still performs
+ * no allocation and never blocks.
+ */
+static serial_image_slot_t *s_slots;
 static QueueHandle_t s_free_slots;
 static QueueHandle_t s_pending_slots;
 static StaticQueue_t s_free_queue_control;
@@ -156,17 +164,21 @@ static void serial_writer_task(void *argument)
         uint32_t dropped = take_dropped_images();
         if (err == ESP_OK) {
             ESP_LOGI(TAG,
-                     "console JPEG sent seq=%lu src=0x%04x event_ms=%llu "
+                     "console JPEG sent seq=%lu id=%u src=0x%04x event_ms=%llu "
                      "time_source=%s bytes=%lu dropped_since_last=%lu",
-                     (unsigned long)slot->sequence, slot->source_addr,
+                     (unsigned long)slot->sequence,
+                     mesh_image_gateway_device_id_from_addr(slot->source_addr),
+                     slot->source_addr,
                      (unsigned long long)slot->event_time_ms,
                      time_source_name(slot->time_source),
                      (unsigned long)slot->jpeg_len, (unsigned long)dropped);
         } else {
             ESP_LOGE(TAG,
-                     "console JPEG failed seq=%lu src=0x%04x event_ms=%llu "
+                     "console JPEG failed seq=%lu id=%u src=0x%04x event_ms=%llu "
                      "bytes=%lu dropped_since_last=%lu: %s",
-                     (unsigned long)slot->sequence, slot->source_addr,
+                     (unsigned long)slot->sequence,
+                     mesh_image_gateway_device_id_from_addr(slot->source_addr),
+                     slot->source_addr,
                      (unsigned long long)slot->event_time_ms,
                      (unsigned long)slot->jpeg_len, (unsigned long)dropped,
                      esp_err_to_name(err));
@@ -225,6 +237,26 @@ static void image_complete(const server_image_t *image, void *user_ctx)
 
 esp_err_t server_serial_adapter_init(void)
 {
+    const uint32_t slot_caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
+    size_t free_before = heap_caps_get_free_size(slot_caps);
+    size_t largest_before = heap_caps_get_largest_free_block(slot_caps);
+    s_slots = heap_caps_calloc(SERIAL_SLOT_COUNT, sizeof(*s_slots), slot_caps);
+    if (s_slots == NULL) {
+        ESP_LOGE(TAG,
+                 "serial slot allocation failed: bytes=%u free=%u largest=%u",
+                 (unsigned)(SERIAL_SLOT_COUNT * sizeof(*s_slots)),
+                 (unsigned)free_before, (unsigned)largest_before);
+        return ESP_ERR_NO_MEM;
+    }
+    ESP_LOGI(TAG,
+             "serial slots preallocated: bytes=%u internal_free=%u->%u "
+             "largest=%u->%u",
+             (unsigned)(SERIAL_SLOT_COUNT * sizeof(*s_slots)),
+             (unsigned)free_before,
+             (unsigned)heap_caps_get_free_size(slot_caps),
+             (unsigned)largest_before,
+             (unsigned)heap_caps_get_largest_free_block(slot_caps));
+
     s_free_slots = xQueueCreateStatic(
         SERIAL_SLOT_COUNT, sizeof(serial_image_slot_t *),
         s_free_queue_storage, &s_free_queue_control);

@@ -1,0 +1,7 @@
+# Compile-only overlay for simultaneous console JPEG export and Wi-Fi/SNTP.
+# Do not flash these placeholder credentials.
+CONFIG_SERVER_SERIAL_IMAGE_ENABLE=y
+CONFIG_SERVER_WIFI_SNTP_ENABLE=y
+CONFIG_SERVER_HTTP_ENABLE=n
+CONFIG_SERVER_WIFI_SSID="compile-only"
+CONFIG_SERVER_WIFI_PASSWORD=""
