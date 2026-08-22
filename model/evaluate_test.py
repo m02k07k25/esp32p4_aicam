@@ -85,6 +85,14 @@ def parse_args() -> argparse.Namespace:
         default=TEST_PREDICTIONS_PATH,
         help="Per-image prediction output.",
     )
+    parser.add_argument(
+        "--allow-unverified-split",
+        action="store_true",
+        help=(
+            "Evaluate a checkpoint/ONNX model whose training split provenance is "
+            "unverified, with an explicit warning."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -151,14 +159,21 @@ def main() -> None:
             )
         validate_checkpoint_compatibility(checkpoint, args.checkpoint)
         checkpoint_dataset_split = checkpoint.get("dataset_split")
-        if (
-            not isinstance(checkpoint_dataset_split, dict)
-            or checkpoint_dataset_split.get("manifest_sha256")
-            != dataset_split["manifest_sha256"]
-        ):
-            raise ValueError(
-                "Checkpoint and test split manifest do not match. Evaluate only on "
-                "the untouched test split that was recorded during training."
+        checkpoint_digest = (
+            checkpoint_dataset_split.get("manifest_sha256")
+            if isinstance(checkpoint_dataset_split, dict)
+            else None
+        )
+        if checkpoint_digest != dataset_split["manifest_sha256"]:
+            if not args.allow_unverified_split:
+                raise ValueError(
+                    "Checkpoint and test split manifest do not match. Evaluate only on "
+                    "the untouched test split that was recorded during training, or "
+                    "pass --allow-unverified-split for an explicitly unverified checkpoint."
+                )
+            print(
+                "WARNING: checkpoint split provenance is unverified; this test result "
+                "is diagnostic and is not an official training-split comparison."
             )
     else:
         if args.batch_size != 1:
@@ -167,12 +182,14 @@ def main() -> None:
                 "use --batch-size 1."
             )
         metadata = validate_onnx_metadata(args.onnx)
-        if (
-            metadata["dataset_split_manifest_sha256"]
-            != dataset_split["manifest_sha256"]
-        ):
-            raise ValueError(
-                "ONNX model and test split manifest do not match."
+        if metadata["dataset_split_manifest_sha256"] != dataset_split["manifest_sha256"]:
+            if not args.allow_unverified_split or metadata.get(
+                "dataset_split_verified", "true"
+            ) != "false":
+                raise ValueError("ONNX model and test split manifest do not match.")
+            print(
+                "WARNING: ONNX checkpoint split provenance is unverified; this test "
+                "result is diagnostic only."
             )
         import onnxruntime as ort
 

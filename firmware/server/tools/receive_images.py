@@ -474,6 +474,33 @@ class ConsoleLogWriter:
             sys.stdout.flush()
 
 
+def _open_console_uart(serial_module, port_name: str, baud: int):
+    """Open the server UART without asserting ESP32 boot-control lines.
+
+    pyserial defaults DTR and RTS to ``True``.  On ESP32-CAM USB-UART
+    adapters those lines commonly drive EN and IO0 through the automatic
+    download circuit, so opening the receiver could leave a button-less
+    board in ROM download mode.  Configure the line states while the port is
+    still closed, then open it with both signals deasserted (normal boot).
+    """
+
+    uart = serial_module.Serial(
+        port=None,
+        baudrate=baud,
+        timeout=0.25,
+        dsrdtr=False,
+        rtscts=False,
+    )
+    uart.port = port_name
+    uart.dtr = False
+    uart.rts = False
+    uart.open()
+    # Keep them deasserted if a backend reapplies its defaults on open.
+    uart.dtr = False
+    uart.rts = False
+    return uart
+
+
 def receive_forever(port_name: str, baud: int, output: Path,
                     locations: Optional[dict[int, str]] = None) -> int:
     try:
@@ -532,7 +559,7 @@ def receive_forever(port_name: str, baud: int, output: Path,
             )
 
     try:
-        uart = serial.Serial(port=port_name, baudrate=baud, timeout=0.25)
+        uart = _open_console_uart(serial, port_name, baud)
     except Exception as exc:  # pyserial exception types are unavailable above
         print(f"cannot open {port_name}: {exc}", file=sys.stderr)
         return 2

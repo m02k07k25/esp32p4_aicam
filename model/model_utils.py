@@ -14,7 +14,7 @@ INPUT_STD = (0.5, 0.5, 0.5)
 FIVE_CROP_AGGREGATION = "max_human_score_over_five_half_frame_crops"
 # Selected on the quantized validation split using balanced accuracy. This is
 # stored with the exact round-trip value of the float used by firmware.
-FIVE_CROP_HUMAN_THRESHOLD = 0.72482645511627197
+FIVE_CROP_HUMAN_THRESHOLD = 0.97517770528793335
 SUPPORTED_IMAGE_SUFFIXES = {".bmp", ".jpeg", ".jpg", ".png"}
 TRAIN_AUGMENTATION_PROFILE = "exclusive_photometric_v1"
 TRAIN_AUGMENTATION_CONFIG = {
@@ -79,6 +79,62 @@ def file_sha256(path: Path) -> str:
         for chunk in iter(lambda: source.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def checkpoint_split_provenance(
+    checkpoint: dict[str, object],
+    checkpoint_path: Path,
+    *,
+    allow_unverified: bool = False,
+) -> dict[str, object]:
+    """Return a reproducible split digest without hiding weak provenance.
+
+    Training checkpoints produced by this repository contain the SHA-256 of
+    ``model/data/split_manifest.json``.  A checkpoint supplied from outside
+    the pipeline may only say ``manual`` (or omit the field entirely).  Such a
+    checkpoint can still be exported deliberately, but its derived digest is
+    marked unverified and is never silently treated as the repository split.
+    """
+
+    raw_split = checkpoint.get("dataset_split")
+    if not isinstance(raw_split, dict):
+        raw_split = {}
+
+    reported_digest = raw_split.get("manifest_sha256")
+    if (
+        isinstance(reported_digest, str)
+        and len(reported_digest) == 64
+        and all(character in "0123456789abcdef" for character in reported_digest.lower())
+    ):
+        return {
+            "digest": reported_digest.lower(),
+            "verified": True,
+            "reported": reported_digest,
+            "description": "checkpoint references a content-addressed split manifest",
+        }
+
+    if not allow_unverified:
+        raise ValueError(
+            f"Checkpoint {checkpoint_path} does not contain a valid dataset split digest. "
+            "Pass --allow-unverified-split only when the training split is unavailable."
+        )
+
+    canonical = json.dumps(
+        raw_split,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+    derived_digest = hashlib.sha256(canonical).hexdigest()
+    return {
+        "digest": derived_digest,
+        "verified": False,
+        "reported": reported_digest,
+        "description": (
+            "checkpoint split provenance is unverified; digest is derived from "
+            "the checkpoint's dataset_split metadata"
+        ),
+    }
 
 
 def validate_onnx_metadata(onnx_path: Path) -> dict[str, str]:

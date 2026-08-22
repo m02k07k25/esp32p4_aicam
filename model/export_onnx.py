@@ -15,6 +15,7 @@ from model_utils import (
     ONNX_PATH,
     PREPROCESS_PROFILE,
     build_model,
+    checkpoint_split_provenance,
     checkpoint_state_dict,
     ensure_parent_dir,
     file_sha256,
@@ -30,6 +31,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--opset", type=int, default=18, help="ONNX opset version.")
     parser.add_argument("--device", default="cpu", help='Torch device string. Use "cpu" unless you know you need another target.')
     parser.add_argument("--skip-verify", action="store_true", help="Skip ONNX shape verification after export.")
+    parser.add_argument(
+        "--allow-unverified-split",
+        action="store_true",
+        help=(
+            "Export a checkpoint whose training split is not content-addressed. "
+            "The ONNX metadata will mark the split as unverified."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -47,7 +56,7 @@ def add_onnx_metadata(
     onnx_path: Path,
     labels: list[str],
     checkpoint_path: Path,
-    dataset_split: dict[str, object],
+    split_provenance: dict[str, object],
 ) -> None:
     import onnx
 
@@ -61,9 +70,9 @@ def add_onnx_metadata(
         "input_std": json.dumps(list(INPUT_STD)),
         "labels": json.dumps(labels),
         "source_checkpoint_sha256": file_sha256(checkpoint_path),
-        "dataset_split_manifest_sha256": str(
-            dataset_split["manifest_sha256"]
-        ),
+        "dataset_split_manifest_sha256": str(split_provenance["digest"]),
+        "dataset_split_verified": "true" if split_provenance["verified"] else "false",
+        "dataset_split_provenance": str(split_provenance["description"]),
     }
     del model.metadata_props[:]
     for key, value in metadata.items():
@@ -97,15 +106,11 @@ def main() -> None:
             f"match {expected_class_to_idx}."
         )
     validate_checkpoint_compatibility(checkpoint, args.checkpoint)
-    dataset_split = checkpoint.get("dataset_split")
-    if (
-        not isinstance(dataset_split, dict)
-        or not isinstance(dataset_split.get("manifest_sha256"), str)
-        or len(dataset_split["manifest_sha256"]) != 64
-    ):
-        raise ValueError(
-            f"Checkpoint {args.checkpoint} does not contain a valid dataset split digest."
-        )
+    split_provenance = checkpoint_split_provenance(
+        checkpoint,
+        args.checkpoint,
+        allow_unverified=args.allow_unverified_split,
+    )
 
     model = build_model(num_classes=NUM_CLASSES, pretrained=False)
     try:
@@ -136,7 +141,7 @@ def main() -> None:
         args.output,
         labels,
         args.checkpoint,
-        dataset_split,
+        split_provenance,
     )
 
     if not args.skip_verify:

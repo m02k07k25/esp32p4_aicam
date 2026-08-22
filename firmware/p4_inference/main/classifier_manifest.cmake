@@ -51,7 +51,7 @@ function(validate_classifier_model classifier_model)
         OR NOT classifier_label_1 STREQUAL "human"
         OR NOT classifier_aggregation STREQUAL "max_human_score_over_five_half_frame_crops"
         OR NOT classifier_human_class STREQUAL "human"
-        OR NOT classifier_human_threshold STREQUAL "0.72482645511627197"
+        OR NOT classifier_human_threshold STREQUAL "0.97517770528793335"
         OR NOT classifier_decision_rule STREQUAL "gte"
         OR NOT classifier_threshold_source STREQUAL "validation_balanced_accuracy"
         OR NOT classifier_target STREQUAL "esp32p4"

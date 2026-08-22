@@ -105,6 +105,14 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=SPLIT_MANIFEST_PATH,
     )
+    parser.add_argument(
+        "--allow-unverified-split",
+        action="store_true",
+        help=(
+            "Use an ONNX model whose checkpoint split is unverified. The current "
+            "repository split is still used for calibration and optional diagnostics."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -213,6 +221,13 @@ def write_espdl_manifest(
         "dataset_split_manifest_sha256": onnx_metadata[
             "dataset_split_manifest_sha256"
         ],
+        "dataset_split_verified": onnx_metadata.get(
+            "dataset_split_verified", "true"
+        ) == "true",
+        "dataset_split_provenance": onnx_metadata.get(
+            "dataset_split_provenance",
+            "checkpoint references a content-addressed split manifest",
+        ),
         "quantization": {
             "target": target,
             "bits": bits,
@@ -376,7 +391,14 @@ def evaluate_quantized_graph(
         onnx_metadata["dataset_split_manifest_sha256"]
         != dataset_split["manifest_sha256"]
     ):
-        raise ValueError("ONNX model and test split manifest do not match.")
+        if not args.allow_unverified_split or onnx_metadata.get(
+            "dataset_split_verified", "true"
+        ) != "false":
+            raise ValueError("ONNX model and test split manifest do not match.")
+        print(
+            "WARNING: checkpoint split provenance is unverified; evaluation "
+            "against the repository split is diagnostic only."
+        )
 
     dataset = FixedOrderImageDataset(evaluation_dir, labels, transform=None)
     transform = build_transforms(train=False)
@@ -556,8 +578,17 @@ def main() -> None:
         onnx_metadata["dataset_split_manifest_sha256"]
         != dataset_split["manifest_sha256"]
     ):
-        raise ValueError(
-            "ONNX model and calibration split manifest do not match."
+        if not args.allow_unverified_split or onnx_metadata.get(
+            "dataset_split_verified", "true"
+        ) != "false":
+            raise ValueError(
+                "ONNX model and calibration split manifest do not match. "
+                "Pass --allow-unverified-split only for a checkpoint explicitly "
+                "marked with unverified split provenance."
+            )
+        print(
+            "WARNING: checkpoint split provenance is unverified; using the "
+            "repository calibration split for quantization."
         )
     (
         QuantizationSettingFactory,

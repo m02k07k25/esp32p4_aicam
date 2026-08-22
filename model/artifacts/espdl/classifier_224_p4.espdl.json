@@ -21,12 +21,14 @@
   "inference": {
     "aggregation": "max_human_score_over_five_half_frame_crops",
     "human_class": "human",
-    "human_threshold": "0.72482645511627197",
+    "human_threshold": "0.97517770528793335",
     "decision_rule": "gte",
     "threshold_source": "validation_balanced_accuracy"
   },
-  "source_checkpoint_sha256": "4ca4cb68c1747cc1ffc5bedd55d399c39c4a2787a029a3b309896667a8e093db",
-  "dataset_split_manifest_sha256": "0e8914f2176a84c5749eb5331e0e004960c052ff70cb94c86e5399bca15fbbe5",
+  "source_checkpoint_sha256": "b896009b72c0d6d6f1ba16d864ff1f954bfb9dbb2004bb5ddfacec0284a2e246",
+  "dataset_split_manifest_sha256": "e69532809b5d2609acac3e47e1083c3d26339d28939517d27fc2ba7468883b57",
+  "dataset_split_verified": false,
+  "dataset_split_provenance": "checkpoint split provenance is unverified; digest is derived from the checkpoint's dataset_split metadata",
   "quantization": {
     "target": "esp32p4",
     "bits": 8,
@@ -38,6 +40,6 @@
     ]
   },
   "source_onnx": "classifier_224.onnx",
-  "source_onnx_sha256": "0708ae85da93dbb0e7ad13d6ba58f2015c4a15de8167fb52f94996441a8db346",
-  "espdl_sha256": "78be2aaf56f370d712ab728be8f50fed7f960ef324ef95d414207eaa767fd62b"
+  "source_onnx_sha256": "37944919ce2b84a054bb7afa186d745204c540eb9930c4475e0468ea0cd0e25c",
+  "espdl_sha256": "2d7f60b729808f2dc5ecb6b2ec7146ff87bc44ef4ec35c8d54f23888158542a9"
 }
