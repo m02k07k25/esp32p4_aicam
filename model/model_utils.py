@@ -12,9 +12,10 @@ PREPROCESS_PROFILE = "keras_mobilenet_v2_minus_one_to_one"
 INPUT_MEAN = (0.5, 0.5, 0.5)
 INPUT_STD = (0.5, 0.5, 0.5)
 FIVE_CROP_AGGREGATION = "max_human_score_over_five_half_frame_crops"
-# Selected on the quantized validation split using balanced accuracy. This is
-# stored with the exact round-trip value of the float used by firmware.
-FIVE_CROP_HUMAN_THRESHOLD = 0.97517770528793335
+# Field-test override for the current camera/model domain. The previous
+# validation-derived threshold (0.97517770528793335) was too conservative for
+# the live camera, where human scores around 0.8 were observed.
+FIVE_CROP_HUMAN_THRESHOLD = 0.75
 SUPPORTED_IMAGE_SUFFIXES = {".bmp", ".jpeg", ".jpg", ".png"}
 TRAIN_AUGMENTATION_PROFILE = "exclusive_photometric_v1"
 TRAIN_AUGMENTATION_CONFIG = {

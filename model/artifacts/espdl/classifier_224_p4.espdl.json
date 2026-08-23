@@ -21,9 +21,9 @@
   "inference": {
     "aggregation": "max_human_score_over_five_half_frame_crops",
     "human_class": "human",
-    "human_threshold": "0.97517770528793335",
+    "human_threshold": "0.75",
     "decision_rule": "gte",
-    "threshold_source": "validation_balanced_accuracy"
+    "threshold_source": "command_line_override"
   },
   "source_checkpoint_sha256": "b896009b72c0d6d6f1ba16d864ff1f954bfb9dbb2004bb5ddfacec0284a2e246",
   "dataset_split_manifest_sha256": "e69532809b5d2609acac3e47e1083c3d26339d28939517d27fc2ba7468883b57",

@@ -859,8 +859,11 @@ bool sdio_frame_tx_remote_ready(void)
 #if CONFIG_ESP_HOSTED_ENABLE_PEER_DATA_TRANSFER
     bool ready = false;
     if (s_state_lock != NULL && xSemaphoreTake(s_state_lock, portMAX_DELAY) == pdTRUE) {
+        /* A missing server-clock reply must not block image delivery.  The
+         * capture-time helper returns zero until a valid server mapping is
+         * available, and zero is the protocol's explicit UNKNOWN timestamp. */
         ready = s_transport_up && s_remote_state == SDIO_FRAME_CONTROL_READY &&
-                s_active_frame_id == 0 && !s_time_query_outstanding;
+                s_active_frame_id == 0;
         xSemaphoreGive(s_state_lock);
     }
     return ready;
@@ -927,8 +930,11 @@ esp_err_t sdio_frame_tx_submit_event(const uint8_t *jpeg,
         free_job(job);
         return ESP_ERR_TIMEOUT;
     }
+    /* Sending is allowed while a server-clock query is outstanding.  If the
+     * query later succeeds, subsequent captures carry server time; otherwise
+     * this frame keeps detected_at_ms=0 and remains valid. */
     if (!s_transport_up || s_remote_state != SDIO_FRAME_CONTROL_READY ||
-        s_active_frame_id != 0 || s_time_query_outstanding) {
+        s_active_frame_id != 0) {
         xSemaphoreGive(s_state_lock);
         free_job(job);
         return ESP_ERR_INVALID_STATE;

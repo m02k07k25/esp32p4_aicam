@@ -51,9 +51,9 @@ function(validate_classifier_model classifier_model)
         OR NOT classifier_label_1 STREQUAL "human"
         OR NOT classifier_aggregation STREQUAL "max_human_score_over_five_half_frame_crops"
         OR NOT classifier_human_class STREQUAL "human"
-        OR NOT classifier_human_threshold STREQUAL "0.97517770528793335"
+        OR NOT classifier_human_threshold STREQUAL "0.75"
         OR NOT classifier_decision_rule STREQUAL "gte"
-        OR NOT classifier_threshold_source STREQUAL "validation_balanced_accuracy"
+        OR NOT classifier_threshold_source STREQUAL "command_line_override"
         OR NOT classifier_target STREQUAL "esp32p4"
         OR NOT classifier_bits STREQUAL "8"
         OR NOT classifier_precision_profile STREQUAL "mixed_int8_int16"
@@ -63,7 +63,7 @@ function(validate_classifier_model classifier_model)
         OR NOT classifier_mixed_1 STREQUAL "/features/features.1/conv/conv.0/conv.0.2/Clip")
         message(FATAL_ERROR
             "Incompatible classifier metadata in ${classifier_manifest}.\n"
-            "Expected MobileNetV2 0.35, 224x224, Keras [-1,1] preprocessing, labels [no_human,human], the float32 val-derived five-crop threshold, and the validated ESP32-P4 mixed INT8/INT16 profile.\n"
+            "Expected MobileNetV2 0.35, 224x224, Keras [-1,1] preprocessing, labels [no_human,human], the field-test five-crop threshold override, and the validated ESP32-P4 mixed INT8/INT16 profile.\n"
             "Regenerate the model with the current training/export/quantization pipeline.")
     endif()
 
