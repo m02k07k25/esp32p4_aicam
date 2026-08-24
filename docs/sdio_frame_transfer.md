@@ -6,7 +6,7 @@ SDIO는 P4와 C6 사이의 ESP-Hosted 통신 버스이며 SD 카드를 뜻하지
 | --- | --- | --- | --- |
 | ESP32-P4 | `firmware/p4_inference` | human 추론, server-derived 시각 기록, 224×224 JPEG, SDIO host | Ethernet HTTP `:80` |
 | ESP32-C6 | `firmware/c6_sdio_ble` | SDIO slave, JPEG 검증, Mesh source/relay | ID `N` → unicast `N + 1` |
-| ESP32-CAM 등 BLE/Wi-Fi ESP | `firmware/server` | provisioner, 기준 SNTP 시각, 이미지 sink, 재조립/NACK | local unicast `0x0001`, Wi-Fi/SNTP, USB console |
+| ESP32-CAM 등 BLE Mesh ESP | `firmware/server` | provisioner, 노트북 기준시각, 이미지 sink, 재조립/NACK | local unicast `0x0001`, 양방향 USB console |
 
 기존 `firmware/c6_hosted`는 Wi-Fi/HTTP 수신기와 SDIO v1을 보존하며 이 조합의 상대 펌웨어가 아닙니다.
 
@@ -33,12 +33,15 @@ Mesh server는 C6와 무선으로 통신하므로 별도 데이터 배선이 없
 
 ## 시간 동기화
 
-ESP32-CAM Mesh 서버가 유일한 wall-clock authority입니다. 서버는 Wi-Fi로
-SNTP를 유지하고 P4는 SNTP를 실행하지 않습니다. P4의 Ethernet 연결은
-`/pic`, `/record`, `/classify.jpg` HTTP용이지 시각 원본이 아닙니다.
+ESP32-CAM Mesh 서버가 Mesh의 wall-clock authority입니다. 기본 구성에서는 PC
+Python 수신기가 실행 직후와 1분마다 노트북 Unix ms를 USB console RX로 보내고,
+서버는 이를 monotonic clock에 고정합니다. 이미지 송수신 중인 갱신은 건너뛰며,
+5분 동안 유효한 갱신이 없으면 만료됩니다.
+P4는 SNTP를 실행하지 않으며 Ethernet 연결은 `/pic`, `/record`,
+`/classify.jpg` HTTP용이지 시각 원본이 아닙니다.
 
 ```text
-ESP32-CAM SNTP
+Laptop OS clock → 28B CRC UART packet → ESP32-CAM server
   → TIME_STATUS 0xCB(server RX/TX Unix ms)
   → C6
   → 40B SDIO TIME SAMPLE
@@ -60,7 +63,7 @@ request ID, 잘못된 timestamp 순서 또는 10초를 넘긴 round trip은 표�
 epoch millisecond를 읽으므로 이후 추론·SDIO·Mesh 병목이 검출시각을 바꾸지
 않습니다.
 
-- 서버 SNTP가 유효함: TIME_STATUS `OK`, P4가 server-derived
+- 서버의 노트북 시각 표본이 유효함: TIME_STATUS `OK`, P4가 server-derived
   `detected_at_ms`를 frame 획득 시 붙임
 - 서버가 부팅 후 아직 동기화되지 않았거나 server clock이 만료됨:
   TIME_STATUS `UNAVAILABLE`과 두 개의 0 timestamp
@@ -71,8 +74,8 @@ epoch millisecond를 읽으므로 이후 추론·SDIO·Mesh 병목이 검출시�
   `SERVER_TIME_UNKNOWN`
 
 현재 serial/Python 출력의 `SERVER_TIME_P4_DETECTED`라는 enum 이름은 P4가
-frame 획득 시 OPEN에 붙인 시각이라는 뜻입니다. 그 수치의 원본은
-ESP32-CAM 서버 SNTP이며 P4 자체 SNTP가 아닙니다.
+frame 획득 시 OPEN에 붙인 시각이라는 뜻입니다. 그 수치의 원본은 노트북
+표본을 받은 ESP32-CAM 서버이며 P4 자체 SNTP가 아닙니다.
 
 ## SDIO protocol v3
 
@@ -218,23 +221,20 @@ ESP32-CAM은 target `esp32`로 빌드합니다. 이 firmware는 ESP32-CAM의 카
 주변장치나 카메라 GPIO를 사용하지 않으며, 선택한 다른 칩도 ESP-IDF BLE Mesh를
 지원해야 합니다. 안정적인 5 V 전원을 사용합니다.
 
-ESP32-CAM에서 COM 로그/JPEG와 기준 SNTP를 함께 사용하려면 menuconfig의
-`Mesh image server`에서 다음을 설정합니다.
+ESP32-CAM에서 COM 로그/JPEG와 노트북 기준시각을 함께 사용하려면 기본
+menuconfig가 다음과 같아야 합니다.
 
 ```text
 CONFIG_SERVER_SERIAL_IMAGE_ENABLE=y
-CONFIG_SERVER_WIFI_SNTP_ENABLE=y
-CONFIG_SERVER_WIFI_SSID="..."
-CONFIG_SERVER_WIFI_PASSWORD="..."
-CONFIG_SERVER_SNTP_SERVER="pool.ntp.org"
+CONFIG_SERVER_SERIAL_TIME_ENABLE=y
+CONFIG_SERVER_WIFI_SNTP_ENABLE=n
 ```
 
-폐쇄망에서는 접근 가능한 LAN NTP 주소를 사용합니다. 실제 자격 증명은
-git에 추적되는 `sdkconfig.defaults`나 test overlay에 넣지 않습니다. 서버
-SNTP clock은 마지막 성공 후 기본 2시간까지 유효하며, P4의 개별 anchor가
-15분 뒤 만료되는 것과는 별도 규칙입니다. Wi-Fi scan/reconnect는 BLE와
-2.4 GHz radio를 공유해 일시적으로 Mesh latency를 늘릴 수 있지만 SNTP
-트래픽은 작고 USB COM과 충돌하지 않습니다.
+SSID나 Internet 연결은 필요 없습니다. `receive_images.py`가 보내는 28바이트
+`BMTIME01` 패킷은 CRC-32로 보호되며 마지막 유효 패킷 후 5분까지만 서버
+clock으로 사용됩니다. 노트북 OS의 시간이 맞아야 합니다. UART는 full-duplex라
+PC→서버 시각과 서버→PC 로그/JPEG가 같은 COM에서 동시에 동작합니다. 선택형
+Wi-Fi/SNTP를 다시 쓰려면 serial time을 끄고 Wi-Fi/SNTP를 켭니다.
 
 기본 설정은 `CONFIG_SERVER_SERIAL_IMAGE_ENABLE=y`이며 console UART를
 921600 baud로 사용합니다. 일반 로그와 완성 JPEG frame이 같은 USB console
@@ -323,7 +323,7 @@ idf.py -p COM_P4 flash monitor
 서버 COM을 Python 도구로 연 뒤 ESP32-CAM에서 다음 로그를 먼저 확인합니다.
 
 ```text
-SNTP synchronized: epoch_ms=...
+laptop clock synchronized: epoch_ms=... sequence=...
 TIME_STATUS src=0x0002 request=... status=0 rx_ms=... tx_ms=...
 ```
 
@@ -350,14 +350,15 @@ received_images/latest.json
 ```
 
 여기서 `P4_DETECTED`는 P4가 fresh frame에 붙인 capture timestamp라는
-provenance 이름이며, 절대시각 값 자체는 ESP32-CAM SNTP 표본에서 파생됩니다.
+provenance 이름이며, 절대시각 값 자체는 노트북 UART 표본에서 파생됩니다.
 P4가 0을 보냈고 server fallback이 적용되면 `RX_ESTIMATE`, 양쪽 시계가 모두
 유효하지 않으면 `UNKNOWN`이 표시됩니다.
 
-Wi-Fi/SNTP는 serial 출력과 함께 켭니다. HTTP 이미지 출력은 COM 이미지
-출력의 대체 adapter이므로 꼭 필요할 때만
-`CONFIG_SERVER_SERIAL_IMAGE_ENABLE=n`, `CONFIG_SERVER_HTTP_ENABLE=y`로
-빌드합니다. serial/HTTP 출력 두 adapter는 동시에 켤 수 없습니다.
+기본 serial time/image 구성에서는 Wi-Fi를 켜지 않습니다. 펌웨어 HTTP 이미지
+출력은 COM 이미지 출력의 대체 adapter이므로 꼭 필요할 때만 serial time과
+serial image를 끄고 `CONFIG_SERVER_SERIAL_IMAGE_ENABLE=n`,
+`CONFIG_SERVER_HTTP_ENABLE=y`로 빌드합니다. serial/HTTP 출력 두 adapter는
+동시에 켤 수 없습니다.
 
 자동 이벤트 테스트:
 
@@ -408,9 +409,10 @@ Mesh NVS를 초기화하고 재provisioning합니다. 이후 각 C6는
 
 ## 장애 확인
 
-- P4 timestamp가 계속 `0`: ESP32-CAM의 Wi-Fi IP와 `SNTP synchronized`,
-  C6의 CA/CB TIME route, P4의 `server clock synchronized` 및 SDIO link 확인;
-  server clock/P4 anchor 만료 여부도 확인
+- P4 timestamp가 계속 `0`: Python 수신기의 `laptop time sync enabled`,
+  ESP32-CAM의 `laptop clock synchronized`, C6의 CA/CB TIME route, P4의
+  `server clock synchronized` 및 SDIO link 확인; 5분 server clock/P4 anchor
+  만료 여부도 확인
 - P4가 `NOT_READY`: C6 provisioning, AppKey bind, publication `0x0001` 확인
 - 서버가 `BUSY`: 다른 source의 active frame 종료 대기; C6가 jitter backoff 후 재시도
 - `NACK`: 서버 bitmap에 표시된 chunk만 C6가 재전송하는지 확인

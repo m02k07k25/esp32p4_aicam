@@ -51,7 +51,7 @@ CONFIG_WIFI_RMT_RX_BA_WIN=32
 # CONFIG_ESP_WIFI_REMOTE_EAP_ENABLED is not set
 
 # P4 inference exposes its own HTTP server over Ethernet. The custom SDIO
-# sender is driven only by the 30-second human monitor and paired c6_sdio_ble.
+# sender is driven only by the 10-second human monitor and paired c6_sdio_ble.
 # CONFIG_EXAMPLE_CONNECT_WIFI is not set
 CONFIG_EXAMPLE_CONNECT_ETHERNET=y
 # The autonomous inference path does not require a P4 network interface.

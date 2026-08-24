@@ -13,7 +13,7 @@ extern "C" {
  * than C6's five-second Gateway response timeout, but short enough that a late
  * response cannot silently become the clock source. */
 #define SDIO_TIME_QUERY_TIMEOUT_US       (10LL * 1000LL * 1000LL)
-/* Keep clock work out of phase with the fixed 30-second inference cadence.
+/* Keep clock work out of phase with the fixed 10-second inference cadence.
  * Prime-ish second intervals prevent a TIME request from repeatedly owning
  * every matching human-detection window after a stable boot. */
 #define SDIO_TIME_QUERY_INTERVAL_US      (307LL * 1000LL * 1000LL)

@@ -32,20 +32,46 @@ menu "Mesh image server"
             by one internal-RAM slot preallocated during startup, and
             transmit it atomically on the same stdout stream as text event
             logs. Use the supplied PC receiver instead of idf.py monitor.
-            This image exporter is mutually exclusive with the HTTP exporter,
-            but it can run together with SERVER_WIFI_SNTP_ENABLE. A 921600-baud
-            console is recommended.
+            This image exporter is mutually exclusive with the HTTP exporter.
+            It can use SERVER_SERIAL_TIME_ENABLE on the same full-duplex UART.
+            A 921600-baud console is recommended.
+
+    config SERVER_SERIAL_TIME_ENABLE
+        bool "Laptop wall clock over the console UART"
+        depends on SERVER_SERIAL_IMAGE_ENABLE && ESP_CONSOLE_UART
+        default y
+        help
+            Receive small CRC-protected Unix-millisecond packets from the PC
+            image receiver and use them as the Gateway clock. The PC sends a
+            packet immediately and periodically, while JPEGs and logs continue
+            in the opposite direction on the same full-duplex UART. This needs
+            no Wi-Fi and is intended for outdoor tests with a connected laptop.
+
+    if SERVER_SERIAL_TIME_ENABLE
+
+        config SERVER_SERIAL_TIME_MAX_AGE_MS
+            int "Maximum laptop clock update age (milliseconds)"
+            range 5000 300000
+            default 300000
+            help
+                Return TIME_STATUS unavailable when no valid laptop packet has
+                arrived for this long. The PC receiver sends every minute by
+                default and updates during image I/O are deliberately skipped,
+                so five minutes tolerates long Mesh transfers while still
+                rejecting an abandoned serial session.
+
+    endif
 
     config SERVER_WIFI_SNTP_ENABLE
         bool "Wi-Fi STA and persistent SNTP server clock"
-        depends on SOC_WIFI_SUPPORTED
+        depends on SOC_WIFI_SUPPORTED && !SERVER_SERIAL_TIME_ENABLE
         default n
         help
             Connect a Wi-Fi-capable server to an access point and maintain its
             Unix wall clock with SNTP. This is independent of the serial and
             HTTP image exporters, so an ESP32-CAM can keep exporting JPEGs on
-            UART while it supplies time to C6 nodes. ESP32-H2 excludes this
-            source entirely.
+            UART while it supplies time to C6 nodes. Disable laptop serial time
+            before selecting this alternative. ESP32-H2 excludes this source.
 
     if SERVER_WIFI_SNTP_ENABLE
 

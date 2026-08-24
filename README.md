@@ -8,7 +8,7 @@ ESP32-P4 카메라와 ESP32-C6, BLE Mesh 이미지 서버를 위한 ESP-IDF 5.5 
 | [`firmware/p4_inference`](firmware/p4_inference/) | ESP32-P4 | 30초 주기 human 추론, 224×224 JPEG 생성 | P4 Ethernet, `/pic`, `/record`, `/classify.jpg`, SDIO host |
 | [`firmware/c6_hosted`](firmware/c6_hosted/) | ESP32-C6 | 기존 ESP-Hosted Wi-Fi/HTTP 보존 펌웨어 | C6 Wi-Fi, `http://<C6_IP>:8081/` |
 | [`firmware/c6_sdio_ble`](firmware/c6_sdio_ble/) | ESP32-C6 | P4 JPEG 수신, BLE Mesh 송신 및 relay | SDIO slave + BLE Mesh source |
-| [`firmware/server`](firmware/server/) | ESP32-CAM 등 BLE Mesh 지원 ESP 칩 | 자동 provisioning, 기준 SNTP 시각, JPEG 재조립 및 선택 재전송 요청 | BLE Mesh + Wi-Fi/SNTP + 단일 USB COM 로그/JPEG |
+| [`firmware/server`](firmware/server/) | ESP32-CAM 등 BLE Mesh 지원 ESP 칩 | 자동 provisioning, 노트북 기준시각, JPEG 재조립 및 선택 재전송 요청 | BLE Mesh + 단일 USB COM 양방향 시각/로그/JPEG |
 
 공식 이미지 이벤트 조합은 다음과 같습니다.
 
@@ -16,7 +16,7 @@ ESP32-P4 카메라와 ESP32-C6, BLE Mesh 이미지 서버를 위한 ESP-IDF 5.5 
 P4 inference -- SDIO v3 --> C6 source -- BLE Mesh v2 --> generic server
        224x224 JPEG              relay 가능          재조립/NACK/COMPLETE
 
-P4 monotonic anchor <-- 40B SDIO <-- C6 <-- CA/CB Mesh time <-- server SNTP
+P4 monotonic anchor <-- 40B SDIO <-- C6 <-- CA/CB Mesh time <-- server <-- laptop UART time
 ```
 
 기존 `p4_data ↔ c6_hosted` 조합은 별도 데이터 수집 경로로 유지되며 신규 Mesh 프로토콜과 호환 대상으로 취급하지 않습니다.
@@ -56,9 +56,10 @@ idf.py -p COM_P4 flash monitor
 
 P4는 SNTP를 실행하지 않습니다. Ethernet은 `/pic`, `/record`,
 `/classify.jpg` HTTP용이며 절대시각의 원본이 아닙니다. 기준시각은 아래
-ESP32-CAM 서버가 SNTP로 얻고, BLE Mesh `TIME_REQUEST/TIME_STATUS`와 C6의
-별도 40바이트 SDIO 메시지를 거쳐 P4에 전달합니다. P4는 이 표본을 monotonic
-clock에 고정해 fresh frame 획득시각을 기록합니다.
+Python 수신기가 USB COM으로 서버에 주고, BLE Mesh
+`TIME_REQUEST/TIME_STATUS`와 C6의 별도 40바이트 SDIO 메시지를 거쳐 P4에
+전달합니다. P4는 이 표본을 monotonic clock에 고정해 fresh frame 획득시각을
+기록합니다.
 
 `/classify.jpg`는 JPEG와 분류 헤더를 반환하는 조회 전용 endpoint입니다. 이 HTTP 요청은 SDIO/BLE 전송을 만들지 않으며, 실제 전송은 30초 감시 task에서 human일 때만 시작합니다.
 
@@ -93,9 +94,10 @@ AppKey bind와 publication 목적지 설정까지 수행합니다. 부팅 순서
 
 ### Generic Mesh server
 
-서버 core는 WROOM32 전용이 아니지만, 이 구성에서는 Wi-Fi와 BLE를 지원하는
-ESP32-CAM을 SNTP client이자 Mesh 기준시각 제공자로 사용합니다. ESP32-CAM의
-target은 `esp32`이며 카메라 주변장치나 카메라 GPIO는 사용하지 않습니다.
+서버 core는 WROOM32 전용이 아닙니다. 이 구성에서는 ESP32-CAM을 Mesh
+Provisioner/Gateway로 사용하고, USB로 연결된 노트북의 현재시각을 기준시각으로
+사용합니다. ESP32-CAM target은 `esp32`이며 카메라 주변장치나 카메라 GPIO,
+Wi-Fi를 사용하지 않습니다.
 
 ```powershell
 cd firmware/server
@@ -106,20 +108,18 @@ idf.py build
 idf.py -p COM_SERVER flash
 ```
 
-`Mesh image server`에서 다음을 설정합니다. 실제 SSID와 비밀번호는 추적되는
-`sdkconfig.defaults`에 넣지 않습니다.
+기본 설정은 다음과 같으며 Wi-Fi 자격 증명이 필요 없습니다.
 
 ```text
 CONFIG_SERVER_SERIAL_IMAGE_ENABLE=y
-CONFIG_SERVER_WIFI_SNTP_ENABLE=y
-CONFIG_SERVER_WIFI_SSID="..."
-CONFIG_SERVER_WIFI_PASSWORD="..."
-CONFIG_SERVER_SNTP_SERVER="pool.ntp.org"
+CONFIG_SERVER_SERIAL_TIME_ENABLE=y
+CONFIG_SERVER_WIFI_SNTP_ENABLE=n
 ```
 
-직렬 로그/JPEG와 Wi-Fi/SNTP는 동시에 동작합니다. Wi-Fi 재연결·scan은 BLE와
-2.4 GHz radio를 공유해 일시적으로 Mesh 지연을 늘릴 수 있지만 SNTP 자체의
-트래픽은 작고 USB COM과 충돌하지 않습니다.
+Python은 실행 직후와 1분마다 28바이트 CRC 보호 시각 패킷을 서버로 보내고,
+서버는 반대 방향으로 로그/JPEG를 보냅니다. UART는 full-duplex이므로 같은 COM을
+사용할 수 있습니다. Mesh 재조립 또는 COM JPEG 출력 중인 주기는 건너뛰며,
+마지막 유효 갱신 후 5분이 지나면 `UNAVAILABLE`을 응답합니다.
 
 서버의 local unicast 주소는 `0x0001`이고 C6 ID `N`의 주소는
 `N + 1`입니다. 자동 관리 한도는 기본 10개 node이며 ID는
@@ -135,11 +135,18 @@ python -m pip install pyserial
 python firmware/server/tools/receive_images.py --port COM_SERVER --baud 921600 --output received_images
 ```
 
-C6 ID를 설치 위치와 연결하려면
-`firmware/server/tools/locations.example.json`을 복사해 현장에 맞게 편집한 뒤
-`--locations locations.json`을 추가합니다. 위치 이름은 BLE로 전송하지
-않고 PC에서만 매핑하므로, 장치를 옮겼을 때는 펌웨어 대신 JSON만
-수정하면 됩니다.
+This one Python process owns the COM port, prints firmware logs, saves images
+under `received_images`, and opens a live PC-local viewer at
+`http://127.0.0.1:8000/`. The browser updates automatically after each complete
+validated JPEG. It also supplies the laptop OS time to the server immediately
+and every minute, skipping image-I/O windows; ESP32 Wi-Fi is not used. Add `--no-browser`,
+`--http-port PORT`, `--no-http`, or `--no-time-sync` when needed.
+
+C6 ID를 설치 위치와 연결하려면 기본으로 읽는
+`firmware/server/tools/locations.json`을 편집합니다. 현재 ID 1은 `아차산`으로
+설정되어 있습니다. 위치 이름은 BLE로 전송하지 않고 PC에서만 매핑하므로,
+장치를 옮겼을 때는 펌웨어 대신 JSON만 수정하면 됩니다. 다른 파일을 쓰려면
+`--locations locations.json`을 지정합니다.
 
 정상 사진은 고유 이름의 `.jpg`/`.json`과 `received_images/latest.jpg`,
 `latest.json`으로 저장됩니다. JSON에는 `device_id`, 선택적 `location`,
@@ -147,16 +154,16 @@ Mesh source 주소와 시각이 남습니다. 별도 UART나 USB-UART adapter는
 필요 없습니다.
 부팅 로그도 보려면 Python 실행 뒤 서버의 reset/EN을 누릅니다.
 
-Wi-Fi HTTP 이미지 출력을 COM 대신 사용하려면 menuconfig에서
-`CONFIG_SERVER_SERIAL_IMAGE_ENABLE=n`, `CONFIG_SERVER_HTTP_ENABLE=y`로
-설정합니다. 직렬/HTTP 이미지 출력 adapter만 상호 배타적이며,
-`CONFIG_SERVER_WIFI_SNTP_ENABLE`은 직렬 출력과 병행할 수 있습니다. 이
-구성의 기본 시험은 단일 COM 방식입니다.
+선택형 Wi-Fi/SNTP 또는 펌웨어 HTTP 이미지 출력을 사용하려면 menuconfig에서
+`CONFIG_SERVER_SERIAL_TIME_ENABLE=n`으로 바꿉니다. Wi-Fi HTTP를 COM 대신
+사용할 때는 추가로 `CONFIG_SERVER_SERIAL_IMAGE_ENABLE=n`,
+`CONFIG_SERVER_HTTP_ENABLE=y`로 설정합니다. 야외 기본 시험은 Wi-Fi를 전혀
+켜지 않는 단일 COM 방식입니다.
 
 ## 빠른 통합 확인
 
 1. 서버 Python 수신기에서 provisioner 초기화, local address `0x0001`,
-   `SNTP synchronized` 로그를 확인합니다.
+   `laptop clock synchronized` 로그를 확인합니다.
 2. 개별 COM 진단이 가능하면 C6 monitor에서 provisioning 완료, AppKey bind,
    publication `0x0001`, `ready`를 확인합니다.
 3. 개별 COM 진단이 가능하면 P4 monitor에서 Ethernet IP와

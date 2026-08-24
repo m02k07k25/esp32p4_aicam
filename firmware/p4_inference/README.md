@@ -1,6 +1,6 @@
 # P4 inference
 
-OV5647 프레임을 ESP-DL MobileNetV2 분류기로 추론하는 ESP32-P4 펌웨어입니다. P4 HTTP는 Ethernet으로 제공하고, 별도 감시 task가 30초마다 추론해 `human`일 때만 ESP-Hosted custom SDIO로 `c6_sdio_ble`에 JPEG를 보냅니다.
+OV5647 프레임을 ESP-DL MobileNetV2 분류기로 추론하는 ESP32-P4 펌웨어입니다. P4 HTTP는 Ethernet으로 제공하고, 별도 감시 task가 10초마다 추론해 `human`일 때만 ESP-Hosted custom SDIO로 `c6_sdio_ble`에 JPEG를 보냅니다.
 
 | 경로 | 기능 |
 | --- | --- |
@@ -10,9 +10,9 @@ OV5647 프레임을 ESP-DL MobileNetV2 분류기로 추론하는 ESP32-P4 펌웨
 
 `/classify.jpg` 응답에는 `X-Class-Index`, `X-Class-Label`, `X-Class-Score`, `X-Inference-Time-Ms`, `X-Inference-Total-Ms` 헤더가 포함됩니다. 이 endpoint는 조회 전용이므로 SDIO 전송을 시작하지 않습니다.
 
-자동 감시 경로는 30초마다 five-crop 추론을 실행합니다. 800×800 입력에서는 좌상단 `[0,0,400,400]`, 우상단 `[400,0,800,400]`, 좌하단 `[0,400,400,800]`, 우하단 `[400,400,800,800]`, 중앙 `[200,200,600,600]`을 평가합니다. 결과가 `human`이고 C6가 `READY`이면 이 중 **human 점수가 가장 높은 crop**을 모델과 같은 nearest-neighbor 방식으로 정확히 224×224 RGB565로 리사이즈하고 JPEG로 인코딩합니다. 품질은 60부터 5씩 20까지 낮추며, 30,720바이트 이하인 경우에만 SDIO로 전송합니다.
+자동 감시 경로는 10초마다 five-crop 추론을 실행합니다. 800×800 입력에서는 좌상단 `[0,0,400,400]`, 우상단 `[400,0,800,400]`, 좌하단 `[0,400,400,800]`, 우하단 `[400,400,800,800]`, 중앙 `[200,200,600,600]`을 평가합니다. 결과가 `human`이고 C6가 `READY`이면 이 중 **human 점수가 가장 높은 crop**을 모델과 같은 nearest-neighbor 방식으로 정확히 224×224 RGB565로 리사이즈하고 JPEG로 인코딩합니다. 품질은 60부터 5씩 20까지 낮추며, 30,720바이트 이하인 경우에만 SDIO로 전송합니다.
 
-SDIO link task는 C6 연결이 끊기면 1, 2, 4, 8, 최대 10초 backoff로 재연결합니다. P4와 C6는 한 프레임만 in-flight로 유지하며, BLE 송신·NACK 복구 창이 끝난 뒤 돌아오는 다음 30초 감시 주기에 새 이미지를 보냅니다.
+SDIO link task는 C6 연결이 끊기면 1, 2, 4, 8, 최대 10초 backoff로 재연결합니다. P4와 C6는 한 프레임만 in-flight로 유지하며, BLE 송신·NACK 복구 창이 끝난 뒤 돌아오는 다음 10초 감시 주기에 새 이미지를 보냅니다.
 
 ```powershell
 idf.py set-target esp32p4
@@ -22,9 +22,13 @@ idf.py -p COM_P4 flash monitor
 
 ## Server-authoritative timestamp and SDIO v3
 
-P4 does not run SNTP. The Mesh Gateway is the sole wall-clock authority and
-obtains time through its own SNTP configuration. While C6 is READY and no
-image is in flight, P4 periodically sends a small `SDIO_TIME_MSG_ID` query.
+P4 does not run SNTP. The Mesh Gateway is the sole wall-clock authority and,
+by default, obtains time from the PC receiver over its full-duplex console
+UART. The PC sends its current Unix milliseconds immediately and every minute;
+the Gateway skips updates during image I/O and expires that clock after five
+minutes without an accepted update. While C6 is READY and no image is in
+flight, P4 periodically sends a
+small `SDIO_TIME_MSG_ID` query.
 C6 forwards the request to the configured Gateway and returns the Gateway's
 receive/transmit Unix timestamps. P4 uses the request/response monotonic
 timestamps to estimate a local monotonic-to-Unix mapping without changing the

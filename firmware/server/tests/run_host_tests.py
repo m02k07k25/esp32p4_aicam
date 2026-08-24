@@ -49,6 +49,21 @@ def main() -> int:
     ]
     subprocess.run(serial_command, check=True)
     subprocess.run([str(serial_output)], check=True)
+    serial_time_output = BUILD / "serial_time_header_host_test.exe"
+    serial_time_command = [
+        cc,
+        "-std=c11",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        f"-I{HERE / 'stubs'}",
+        f"-I{SERVER / 'main'}",
+        str(HERE / "serial_time_header_host_test.c"),
+        "-o",
+        str(serial_time_output),
+    ]
+    subprocess.run(serial_time_command, check=True)
+    subprocess.run([str(serial_time_output)], check=True)
     subprocess.run([sys.executable, str(HERE / "serial_protocol_test.py")],
                    check=True)
     subprocess.run([sys.executable, str(HERE / "static_gateway_checks.py")],

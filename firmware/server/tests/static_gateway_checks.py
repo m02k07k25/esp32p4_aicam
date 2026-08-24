@@ -15,6 +15,12 @@ WIFI_SOURCE = (HERE.parent / "main" / "server_wifi_time_adapter.c").read_text(
 SERIAL_SOURCE = (HERE.parent / "main" / "server_serial_adapter.c").read_text(
     encoding="utf-8"
 )
+SERIAL_TIME_SOURCE = (
+    HERE.parent / "main" / "server_serial_time_adapter.c"
+).read_text(encoding="utf-8")
+SERIAL_TIME_HEADER = (
+    HERE.parent / "main" / "server_serial_time_adapter.h"
+).read_text(encoding="utf-8")
 HTTP_SOURCE = (HERE.parent / "main" / "server_http_adapter.c").read_text(
     encoding="utf-8"
 )
@@ -22,6 +28,10 @@ APP_SOURCE = (HERE.parent / "main" / "app_main.c").read_text(
     encoding="utf-8"
 )
 KCONFIG = (HERE.parent / "main" / "Kconfig.projbuild").read_text(
+    encoding="utf-8"
+)
+CMAKE = (HERE.parent / "main" / "CMakeLists.txt").read_text(encoding="utf-8")
+SDKCONFIG_DEFAULTS = (HERE.parent / "sdkconfig.defaults").read_text(
     encoding="utf-8"
 )
 
@@ -230,9 +240,65 @@ for required in (
 if "uint8_t status[sizeof(ble_mesh_time_status_message_t)] = {0}" not in time_handler:
     raise AssertionError("TIME_STATUS reserved bytes/unavailable timestamps are not zeroed")
 
-# Wi-Fi/SNTP is an independent, persistent clock adapter. Serial output may be
-# enabled at the same time, while HTTP reuses this owner instead of initializing
-# a second Wi-Fi or SNTP instance.
+# The default outdoor clock arrives from the same full-duplex console UART
+# used in the opposite direction for JPEG/log output. It is CRC protected,
+# extrapolated from a monotonic anchor, and expires if the PC receiver stops.
+for required in (
+    'SERVER_SERIAL_TIME_MAGIC       "BMTIME01"',
+    "SERVER_SERIAL_TIME_PACKET_SIZE 28U",
+    "SERVER_SERIAL_TIME_CRC_BYTES   24U",
+    "uint64_t unix_ms",
+    "uint32_t sequence",
+    "uint32_t crc32",
+):
+    if required not in SERIAL_TIME_HEADER:
+        raise AssertionError(f"serial-time header is missing: {required}")
+for required in (
+    "uart_driver_install(",
+    "uart_vfs_dev_use_driver(port)",
+    "uart_read_bytes(",
+    "esp_crc32_le(",
+    "SERVER_SERIAL_TIME_CRC_BYTES",
+    "CONFIG_SERVER_SERIAL_TIME_MAX_AGE_MS",
+    "s_anchor_monotonic_us",
+    "mesh_image_gateway_set_time_provider(",
+):
+    if required not in SERIAL_TIME_SOURCE:
+        raise AssertionError(f"laptop serial clock is missing: {required}")
+for forbidden in ("esp_wifi_", "esp_netif_sntp", "gettimeofday"):
+    if forbidden in SERIAL_TIME_SOURCE:
+        raise AssertionError(f"laptop serial clock unexpectedly uses: {forbidden}")
+serial_time_kconfig = KCONFIG[
+    KCONFIG.index("config SERVER_SERIAL_TIME_ENABLE"):
+    KCONFIG.index("config SERVER_WIFI_SNTP_ENABLE")
+]
+for required in (
+    "depends on SERVER_SERIAL_IMAGE_ENABLE && ESP_CONSOLE_UART",
+    "default y",
+    "config SERVER_SERIAL_TIME_MAX_AGE_MS",
+    "default 300000",
+):
+    if required not in serial_time_kconfig:
+        raise AssertionError(f"serial-time Kconfig is missing: {required}")
+if "CONFIG_SERVER_SERIAL_TIME_ENABLE=y" not in SDKCONFIG_DEFAULTS:
+    raise AssertionError("laptop serial time is not enabled by default")
+if 'list(APPEND server_sources "server_serial_time_adapter.c")' not in CMAKE:
+    raise AssertionError("serial-time source is not conditionally compiled")
+if "server_serial_time_adapter_init()" not in APP_SOURCE:
+    raise AssertionError("app_main does not initialize laptop serial time")
+for required in (
+    "mesh_image_gateway_is_receiving()",
+    "server_serial_adapter_is_transmitting()",
+):
+    if required not in SERIAL_TIME_SOURCE:
+        raise AssertionError(f"serial-time image-I/O deferral is missing: {required}")
+if "server_serial_adapter_is_transmitting" not in SERIAL_SOURCE:
+    raise AssertionError("serial JPEG output does not expose its busy state")
+print("PASS: default laptop clock is CRC-protected, monotonic, and expiring")
+
+# Wi-Fi/SNTP remains an optional alternative clock adapter. Serial image output
+# can stay enabled when laptop time is explicitly disabled, while HTTP reuses
+# this owner instead of initializing a second Wi-Fi or SNTP instance.
 if "depends on SOC_WIFI_SUPPORTED && !SERVER_SERIAL_IMAGE_ENABLE" in KCONFIG[
     KCONFIG.index("config SERVER_WIFI_SNTP_ENABLE"):
     KCONFIG.index("config SERVER_HTTP_ENABLE")
@@ -284,7 +350,7 @@ print("PASS: HTTP idle-work reservation blocks racing OPEN")
 print("PASS: unsolicited client-model publication event is handled")
 print("PASS: RX estimate is sampled at OPEN, before JPEG completion")
 print("PASS: managed C6 TIME_REQUEST returns explicit two-timestamp status")
-print("PASS: serial export and persistent Wi-Fi/SNTP have independent ownership")
+print("PASS: persistent Wi-Fi/SNTP remains an explicit alternative clock")
 
 if re.search(
     r"heap_caps_calloc\s*\(\s*SERIAL_SLOT_COUNT\s*,\s*sizeof\(\*s_slots\)\s*,\s*slot_caps\s*\)",

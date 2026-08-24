@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Monitor server logs and extract completed BLE Mesh JPEG records.
+"""Monitor server logs, save BLE Mesh JPEG records, and show them locally.
 
 The server writes ordinary ESP-IDF text logs and framed JPEG records to the
-same console UART.  This program must own that COM port instead of
-``idf.py monitor``: it prints the text bytes and saves only validated images.
+same console UART. This program must own that COM port instead of
+``idf.py monitor``: it prints the text bytes, saves only validated images,
+serves the latest result from a PC-local HTTP viewer, and sends the laptop
+wall clock back to the firmware.
 """
 
 from __future__ import annotations
@@ -12,14 +14,18 @@ import argparse
 import codecs
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
 import struct
 import sys
 import tempfile
+import threading
 import time
 from typing import Callable, Iterable, Optional
+from urllib.parse import urlsplit
+import webbrowser
 import zlib
 
 
@@ -32,11 +38,18 @@ HEADER_STRUCT = struct.Struct("<8sHHHBBQIIII")
 HEADER_SIZE = HEADER_STRUCT.size
 HEADER_CRC_BYTES = HEADER_SIZE - 4
 
+LAPTOP_TIME_MAGIC = b"BMTIME01"
+LAPTOP_TIME_VERSION = 1
+LAPTOP_TIME_STRUCT = struct.Struct("<8sHHQII")
+LAPTOP_TIME_PACKET_SIZE = LAPTOP_TIME_STRUCT.size
+LAPTOP_TIME_CRC_BYTES = LAPTOP_TIME_PACKET_SIZE - 4
+
 TIME_SOURCE_NAMES = {
     0: "P4_DETECTED",
     1: "RX_ESTIMATE",
     2: "UNKNOWN",
 }
+DEFAULT_LOCATIONS_PATH = Path(__file__).with_name("locations.json")
 
 
 class RecordError(ValueError):
@@ -70,6 +83,41 @@ def crc32(data: bytes) -> int:
     """CRC-32/IEEE used by esp_crc32_le(0, data, length)."""
 
     return zlib.crc32(data) & 0xFFFFFFFF
+
+
+def encode_laptop_time_packet(unix_ms: int, sequence: int) -> bytes:
+    """Encode one PC-to-server wall-clock update for the console UART."""
+
+    if unix_ms < 0 or unix_ms > 0xFFFFFFFFFFFFFFFF:
+        raise ValueError("unix_ms must fit in uint64")
+    if sequence < 1 or sequence > 0xFFFFFFFF:
+        raise ValueError("sequence must be in 1..0xffffffff")
+    wire = LAPTOP_TIME_STRUCT.pack(
+        LAPTOP_TIME_MAGIC,
+        LAPTOP_TIME_VERSION,
+        LAPTOP_TIME_PACKET_SIZE,
+        unix_ms,
+        sequence,
+        0,
+    )
+    return wire[:LAPTOP_TIME_CRC_BYTES] + struct.pack(
+        "<I", crc32(wire[:LAPTOP_TIME_CRC_BYTES])
+    )
+
+
+def _send_laptop_time(uart, sequence: int) -> int:
+    """Send the current laptop time and return the next nonzero sequence."""
+
+    packet = encode_laptop_time_packet(
+        time.time_ns() // 1_000_000, sequence
+    )
+    written = uart.write(packet)
+    if written != len(packet):
+        raise OSError(
+            f"short laptop-time write {written}/{len(packet)} bytes"
+        )
+    uart.flush()
+    return 1 if sequence == 0xFFFFFFFF else sequence + 1
 
 
 def device_id_from_source(source_addr: int) -> int:
@@ -395,6 +443,376 @@ class ImageSink:
         return image_path, metadata
 
 
+VIEWER_HTML = """<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>BLE Mesh image receiver</title>
+  <style>
+    :root { color-scheme: dark; font-family: system-ui, sans-serif; }
+    body { margin: 0; background: #111827; color: #e5e7eb; }
+    [hidden] { display: none !important; }
+    main { width: min(960px, calc(100% - 32px)); margin: 20px auto; }
+    header { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+    h1 { margin: 0; font-size: 1.35rem; }
+    h2 { margin: 0 0 12px; color: #dbeafe; font-size: 1rem; }
+    #state { padding: 5px 10px; border-radius: 999px; background: #374151; }
+    #state.ready { background: #065f46; }
+    .panel { padding: 16px; border-radius: 14px; background: #1f2937;
+             box-shadow: 0 10px 28px #0005; }
+    .latest { margin-top: 14px; }
+    .image-stage { min-height: min(42vh, 420px); display: grid;
+                   place-items: center; border-radius: 10px; background: #111827; }
+    #image { display: block; width: min(100%, 420px); max-height: min(42vh, 420px);
+             object-fit: contain;
+             margin: 0 auto; image-rendering: auto; border-radius: 10px; }
+    #empty { color: #9ca3af; text-align: center; }
+    .info-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+                 gap: 14px; margin-top: 14px; }
+    dl { display: grid; grid-template-columns: max-content 1fr; gap: 8px 16px;
+         margin: 0; }
+    dt { color: #9ca3af; } dd { margin: 0; overflow-wrap: anywhere; }
+    @media (max-width: 680px) {
+      .info-grid { grid-template-columns: 1fr; }
+      .image-stage { min-height: 224px; }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <header><h1>BLE Mesh 이미지 수신기</h1><span id="state">대기 중</span></header>
+  <section class="panel latest">
+    <h2>최신 사진</h2>
+    <div class="image-stage">
+      <div id="empty">검증 완료된 첫 번째 이미지를 기다리고 있습니다.</div>
+      <img id="image" alt="최근 수신한 JPEG" hidden>
+    </div>
+  </section>
+  <div class="info-grid">
+    <section class="panel">
+      <h2>기기 정보</h2>
+      <dl>
+        <dt>기기 ID</dt><dd id="device">-</dd>
+        <dt>설치 위치</dt><dd id="location">-</dd>
+        <dt>Mesh 송신 주소</dt><dd id="source">-</dd>
+      </dl>
+    </section>
+    <section class="panel">
+      <h2>이벤트 정보</h2>
+      <dl>
+        <dt>검출 시각</dt><dd id="event-time">-</dd>
+        <dt>시각 출처</dt><dd id="time-source">-</dd>
+        <dt>PC 수신 시각</dt><dd id="receive-time">-</dd>
+        <dt>JPEG 크기</dt><dd id="image-info">-</dd>
+        <dt>수신 순번</dt><dd id="sequence">-</dd>
+      </dl>
+    </section>
+  </div>
+</main>
+<script>
+const byId = id => document.getElementById(id);
+let lastToken = "";
+function koreanTime(ms) {
+  const value = Number(ms);
+  if (value <= 0) return "알 수 없음";
+  return new Date(value).toLocaleString("ko-KR", {
+    timeZone: "Asia/Seoul",
+    year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", second: "2-digit",
+    hour12: false
+  }) + " KST";
+}
+async function refresh() {
+  try {
+    const response = await fetch(`/status.json?t=${Date.now()}`, {cache: "no-store"});
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const status = await response.json();
+    if (!status.image_available) {
+      byId("state").textContent = "대기 중";
+      return;
+    }
+    const item = status.latest;
+    const token = `${item.sequence}:${item.received_at_ms}:${item.jpeg_crc32}`;
+    if (token !== lastToken) {
+      lastToken = token;
+      byId("image").src = `/latest.jpg?v=${encodeURIComponent(token)}`;
+    }
+    byId("empty").hidden = true;
+    byId("image").hidden = false;
+    byId("state").textContent = "수신 완료";
+    byId("state").className = "ready";
+    byId("device").textContent = item.device_id;
+    byId("location").textContent = item.location || "미설정";
+    byId("source").textContent = item.source_addr_hex;
+    byId("event-time").textContent = koreanTime(item.event_time_ms);
+    byId("time-source").textContent = item.time_source;
+    byId("receive-time").textContent = koreanTime(item.received_at_ms);
+    byId("image-info").textContent = `${(item.jpeg_len / 1024).toFixed(1)} KB`;
+    byId("sequence").textContent = item.sequence;
+  } catch (error) {
+    byId("state").textContent = "화면 오류";
+    byId("state").className = "";
+  } finally {
+    window.setTimeout(refresh, 750);
+  }
+}
+refresh();
+</script>
+</body>
+</html>
+""".encode("utf-8")
+
+
+@dataclass(frozen=True)
+class LatestSnapshot:
+    metadata: dict
+    image_path: Path
+
+
+def _load_latest_snapshot(
+    output: Path, locations: Optional[dict[int, str]] = None
+) -> Optional[LatestSnapshot]:
+    """Resolve a metadata/image pair without exposing arbitrary files."""
+
+    try:
+        metadata = json.loads(
+            (output / "latest.json").read_text(encoding="utf-8")
+        )
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        return None
+    if not isinstance(metadata, dict):
+        return None
+    metadata = dict(metadata)
+
+    device_id = metadata.get("device_id")
+    if isinstance(device_id, int) and locations and device_id in locations:
+        # The PC-side installation map is authoritative and can relabel old
+        # saved frames without touching the BLE/serial wire format.
+        metadata["location"] = locations[device_id]
+
+    file_name = metadata.get("file")
+    jpeg_len = metadata.get("jpeg_len")
+    if (
+        not isinstance(file_name, str)
+        or not file_name
+        or Path(file_name).name != file_name
+        or not isinstance(jpeg_len, int)
+        or isinstance(jpeg_len, bool)
+        or jpeg_len < 1
+        or jpeg_len > MAX_JPEG_BYTES
+    ):
+        return None
+
+    image_path = output / file_name
+    try:
+        if not image_path.is_file() or image_path.stat().st_size != jpeg_len:
+            return None
+    except OSError:
+        return None
+    return LatestSnapshot(metadata=metadata, image_path=image_path)
+
+
+class _ViewerHTTPServer(ThreadingHTTPServer):
+    # SO_REUSEADDR permits multiple live listeners on the same port on
+    # Windows, which can randomly serve a stale viewer process. Require one
+    # owner so a second receiver fails with a clear --http-port suggestion.
+    allow_reuse_address = False
+    daemon_threads = True
+
+
+def _viewer_handler(
+    output: Path,
+    started_at_ms: int,
+    locations: Optional[dict[int, str]] = None,
+):
+    class ViewerHandler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, format_string: str, *args) -> None:
+            # Serial and image events remain readable in the terminal; routine
+            # browser polling must not flood it with one line every 750 ms.
+            del format_string, args
+
+        def _send(
+            self, status: int, body: bytes, content_type: str
+        ) -> None:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store, max-age=0")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            if body:
+                try:
+                    self.wfile.write(body)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+        def _json(self, status: int, value: dict) -> None:
+            body = json.dumps(
+                value, ensure_ascii=False, separators=(",", ":")
+            ).encode("utf-8")
+            self._send(status, body, "application/json; charset=utf-8")
+
+        def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+            route = urlsplit(self.path).path
+            if route in ("/", "/index.html"):
+                self._send(200, VIEWER_HTML, "text/html; charset=utf-8")
+                return
+            if route == "/favicon.ico":
+                self._send(204, b"", "image/x-icon")
+                return
+
+            snapshot = _load_latest_snapshot(output, locations)
+            if route == "/status.json":
+                self._json(
+                    200,
+                    {
+                        "image_available": snapshot is not None,
+                        "viewer_started_at_ms": started_at_ms,
+                        "latest": (
+                            snapshot.metadata if snapshot is not None else None
+                        ),
+                    },
+                )
+                return
+            if route == "/latest.json":
+                if snapshot is None:
+                    self._json(404, {"error": "no completed image yet"})
+                else:
+                    self._json(200, snapshot.metadata)
+                return
+            if route == "/latest.jpg":
+                if snapshot is None:
+                    self._json(404, {"error": "no completed image yet"})
+                    return
+                try:
+                    image = snapshot.image_path.read_bytes()
+                except OSError as exc:
+                    self._json(503, {"error": f"cannot read image: {exc}"})
+                    return
+                self._send(200, image, "image/jpeg")
+                return
+            self._json(404, {"error": "not found"})
+
+    return ViewerHandler
+
+
+class LocalImageViewer:
+    """Small PC-only HTTP viewer backed by ImageSink's atomic files."""
+
+    def __init__(
+        self,
+        output: Path,
+        host: str = "127.0.0.1",
+        port: int = 8000,
+        locations: Optional[dict[int, str]] = None,
+    ) -> None:
+        self.output = output.resolve()
+        self.host = host
+        self.port = port
+        self.locations = dict(locations or {})
+        self._server: Optional[_ViewerHTTPServer] = None
+        self._thread: Optional[threading.Thread] = None
+
+    @property
+    def url(self) -> str:
+        if self._server is None:
+            raise RuntimeError("viewer has not started")
+        actual_port = int(self._server.server_address[1])
+        display_host = (
+            "127.0.0.1" if self.host in ("", "0.0.0.0") else self.host
+        )
+        return f"http://{display_host}:{actual_port}/"
+
+    def start(self) -> str:
+        if self._server is not None:
+            raise RuntimeError("viewer is already running")
+        self.output.mkdir(parents=True, exist_ok=True)
+        started_at_ms = time.time_ns() // 1_000_000
+        handler = _viewer_handler(
+            self.output, started_at_ms, self.locations
+        )
+        server = _ViewerHTTPServer((self.host, self.port), handler)
+        thread = threading.Thread(
+            target=server.serve_forever,
+            name="local-image-http",
+            daemon=True,
+        )
+        self._server = server
+        self._thread = thread
+        thread.start()
+        return self.url
+
+    def close(self) -> None:
+        server = self._server
+        thread = self._thread
+        self._server = None
+        self._thread = None
+        if server is None:
+            return
+        server.shutdown()
+        server.server_close()
+        if thread is not None:
+            thread.join(timeout=2.0)
+
+
+def _open_viewer_browser(viewer_url: str) -> None:
+    try:
+        opened = webbrowser.open(viewer_url, new=2)
+    except Exception as exc:
+        print(
+            f"cannot open browser automatically: {exc}; "
+            f"open {viewer_url} manually",
+            file=sys.stderr,
+        )
+        return
+    if not opened:
+        print(
+            f"browser did not open; open {viewer_url} manually",
+            file=sys.stderr,
+        )
+
+
+def view_only(
+    output: Path,
+    http_host: str = "127.0.0.1",
+    http_port: int = 8000,
+    open_browser: bool = True,
+    locations: Optional[dict[int, str]] = None,
+) -> int:
+    """Serve saved images without opening a board COM port."""
+
+    viewer = LocalImageViewer(output, http_host, http_port, locations)
+    try:
+        viewer_url = viewer.start()
+    except (OSError, RuntimeError) as exc:
+        print(
+            f"cannot start local HTTP viewer on "
+            f"{http_host}:{http_port}: {exc}",
+            file=sys.stderr,
+        )
+        return 2
+
+    print(
+        f"view-only output={output.resolve()} viewer={viewer_url}",
+        flush=True,
+    )
+    if open_browser:
+        _open_viewer_browser(viewer_url)
+    try:
+        while True:
+            time.sleep(1.0)
+    except KeyboardInterrupt:
+        print("stopped", flush=True)
+        return 0
+    finally:
+        viewer.close()
+    return 0
+
+
 class SequenceTracker:
     """Detect a lost/reordered exported record in the global sequence."""
 
@@ -488,6 +906,7 @@ def _open_console_uart(serial_module, port_name: str, baud: int):
         port=None,
         baudrate=baud,
         timeout=0.25,
+        write_timeout=1.0,
         dsrdtr=False,
         rtscts=False,
     )
@@ -501,8 +920,19 @@ def _open_console_uart(serial_module, port_name: str, baud: int):
     return uart
 
 
-def receive_forever(port_name: str, baud: int, output: Path,
-                    locations: Optional[dict[int, str]] = None) -> int:
+def receive_forever(
+    port_name: str,
+    baud: int,
+    output: Path,
+    locations: Optional[dict[int, str]] = None,
+    *,
+    http_enabled: bool = True,
+    http_host: str = "127.0.0.1",
+    http_port: int = 8000,
+    open_browser: bool = True,
+    laptop_time_sync: bool = True,
+    laptop_time_interval_s: float = 60.0,
+) -> int:
     try:
         import serial  # type: ignore
     except ModuleNotFoundError:
@@ -564,10 +994,50 @@ def receive_forever(port_name: str, baud: int, output: Path,
         print(f"cannot open {port_name}: {exc}", file=sys.stderr)
         return 2
 
+    time_sequence = 1
+    next_time_sync_at = 0.0
+    if laptop_time_sync:
+        try:
+            time_sequence = _send_laptop_time(uart, time_sequence)
+        except Exception as exc:
+            uart.close()
+            print(f"initial laptop-time write failed: {exc}", file=sys.stderr)
+            return 2
+        next_time_sync_at = time.monotonic() + laptop_time_interval_s
+
+    viewer: Optional[LocalImageViewer] = None
+    if http_enabled:
+        viewer = LocalImageViewer(
+            output, http_host, http_port, locations
+        )
+        try:
+            viewer_url = viewer.start()
+        except (OSError, RuntimeError) as exc:
+            uart.close()
+            print(
+                f"cannot start local HTTP viewer on "
+                f"{http_host}:{http_port}: {exc}",
+                file=sys.stderr,
+            )
+            print(
+                "choose another port with --http-port, or use --no-http",
+                file=sys.stderr,
+            )
+            return 2
+        print(f"viewer={viewer_url}", flush=True)
+        if open_browser:
+            _open_viewer_browser(viewer_url)
+
     print(
         f"listening port={port_name} baud={baud} output={output.resolve()}",
         flush=True,
     )
+    if laptop_time_sync:
+        print(
+            "laptop time sync enabled "
+            f"interval={laptop_time_interval_s:g}s",
+            flush=True,
+        )
     # Three complete wire-times plus margin avoids false expiry even when the
     # user deliberately selects a much slower console than the 921600 default.
     partial_timeout_s = max(
@@ -576,6 +1046,12 @@ def receive_forever(port_name: str, baud: int, output: Path,
     partial_deadline = PartialRecordDeadline(partial_timeout_s)
     try:
         while True:
+            now = time.monotonic()
+            if (laptop_time_sync and now >= next_time_sync_at and
+                    not parser.has_incomplete_record):
+                time_sequence = _send_laptop_time(uart, time_sequence)
+                next_time_sync_at = now + laptop_time_interval_s
+
             waiting = getattr(uart, "in_waiting", 0)
             chunk = uart.read(min(max(int(waiting), 1), 8192))
             now = time.monotonic()
@@ -594,26 +1070,74 @@ def receive_forever(port_name: str, baud: int, output: Path,
         print(f"serial read failed: {exc}", file=sys.stderr)
         return 2
     finally:
+        if viewer is not None:
+            viewer.close()
         uart.close()
 
 
 def _parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Monitor the server console and save validated JPEG frames"
+        description=(
+            "Monitor the server console, save validated JPEG frames, and "
+            "show them in a PC-local browser"
+        )
     )
-    parser.add_argument("--port", required=True, help="server console COM port")
+    parser.add_argument(
+        "--port", help="server console COM port (not needed with --view-only)"
+    )
     parser.add_argument("--baud", type=int, default=921600)
     parser.add_argument(
         "--output", type=Path, default=Path("received_images"),
         help="output directory (default: received_images)",
     )
     parser.add_argument(
-        "--locations", type=Path,
-        help='optional JSON mapping of C6 IDs to locations, e.g. {"1":"entrance"}',
+        "--locations", type=Path, default=DEFAULT_LOCATIONS_PATH,
+        help=(
+            "JSON mapping of C6 IDs to locations "
+            f"(default: {DEFAULT_LOCATIONS_PATH})"
+        ),
+    )
+    parser.add_argument(
+        "--http-host", default="127.0.0.1",
+        help="PC HTTP viewer bind address (default: 127.0.0.1)",
+    )
+    parser.add_argument(
+        "--http-port", type=int, default=8000,
+        help="PC HTTP viewer port (default: 8000; 0 selects a free port)",
+    )
+    parser.add_argument(
+        "--no-http", action="store_true",
+        help="disable the PC HTTP viewer and only save files/print logs",
+    )
+    parser.add_argument(
+        "--no-browser", action="store_true",
+        help="run the viewer without opening the default browser",
+    )
+    parser.add_argument(
+        "--view-only", action="store_true",
+        help="preview saved images over HTTP without a board or COM port",
+    )
+    parser.add_argument(
+        "--no-time-sync", action="store_true",
+        help="do not send the laptop wall clock to the server firmware",
+    )
+    parser.add_argument(
+        "--time-sync-interval", type=float, default=60.0,
+        help="laptop clock update interval in seconds (default: 60)",
     )
     args = parser.parse_args(argv)
+    if not args.view_only and not args.port:
+        parser.error("--port is required unless --view-only is used")
+    if args.view_only and args.no_http:
+        parser.error("--view-only cannot be combined with --no-http")
     if args.baud <= 0:
         parser.error("--baud must be positive")
+    if not args.http_host.strip():
+        parser.error("--http-host must not be empty")
+    if args.http_port < 0 or args.http_port > 65535:
+        parser.error("--http-port must be between 0 and 65535")
+    if args.time_sync_interval < 1.0 or args.time_sync_interval > 300.0:
+        parser.error("--time-sync-interval must be between 1 and 300 seconds")
     return args
 
 
@@ -624,7 +1148,26 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     except ValueError as exc:
         print(exc, file=sys.stderr)
         return 2
-    return receive_forever(args.port, args.baud, args.output, locations)
+    if args.view_only:
+        return view_only(
+            args.output,
+            http_host=args.http_host,
+            http_port=args.http_port,
+            open_browser=not args.no_browser,
+            locations=locations,
+        )
+    return receive_forever(
+        args.port,
+        args.baud,
+        args.output,
+        locations,
+        http_enabled=not args.no_http,
+        http_host=args.http_host,
+        http_port=args.http_port,
+        open_browser=not args.no_browser,
+        laptop_time_sync=not args.no_time_sync,
+        laptop_time_interval_s=args.time_sync_interval,
+    )
 
 
 if __name__ == "__main__":

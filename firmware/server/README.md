@@ -5,13 +5,13 @@ tied to an ESP32-WROOM module and never forces `IDF_TARGET`. The validated
 target family is the one advertised by the IDF 5.5 BLE Mesh Provisioner
 example: ESP32, ESP32-C3, ESP32-C6, ESP32-C61, ESP32-H2, and ESP32-S3.
 
-The core has no mandatory Wi-Fi dependency. By default every completed JPEG is
-exported over the same USB console stream as the normal event logs. On targets
-with `SOC_WIFI_SUPPORTED`, an independent Wi-Fi STA/SNTP adapter can run at the
-same time as that serial exporter and provide the network's authoritative Unix
-clock. The optional HTTP image exporter reuses the same Wi-Fi/SNTP owner; it
-never initializes a second network stack. Wi-Fi code is not compiled for
-ESP32-H2.
+The core has no mandatory Wi-Fi dependency. By default the PC receiver sends
+the laptop's Unix time into the server while completed JPEGs and normal event
+logs travel in the opposite direction over the same full-duplex USB console.
+An optional Wi-Fi STA/SNTP adapter remains available on Wi-Fi-capable targets,
+but it is not enabled together with laptop serial time. The optional firmware
+HTTP image exporter reuses that Wi-Fi/SNTP owner. Wi-Fi code is not compiled
+for ESP32-H2.
 
 ## Mesh ownership and provisioning
 
@@ -118,14 +118,18 @@ static void received(const server_image_t *image, void *ctx)
 mesh_image_gateway_register_image_callback(received, NULL);
 ```
 
-When `CONFIG_SERVER_WIFI_SNTP_ENABLE=y`, a managed C6 may send `TIME_REQUEST`.
-For a synchronized clock, `TIME_STATUS` echoes the request ID and contains the
+A managed C6 may send `TIME_REQUEST` regardless of which clock adapter is
+selected. By default `receive_images.py` sends a CRC-protected laptop Unix-ms
+sample immediately and every minute. The server anchors it to its local
+monotonic clock, skips updates during Mesh reassembly or console JPEG output,
+and stops using it after five minutes without another accepted sample. For a
+valid clock, `TIME_STATUS` echoes the request ID and contains the
 server's Unix-millisecond time at request receipt and again immediately before
 the response is queued. C6 can combine those values with its local request and
-response instants to estimate offset and round-trip delay. If the server has
-not synchronized since boot, it explicitly returns status `UNAVAILABLE` with
-both timestamps and all reserved bytes zero. Malformed requests and requests
-from devices outside the validated C6 table are ignored.
+response instants to estimate offset and round-trip delay. If no valid clock is
+available, the server explicitly returns status `UNAVAILABLE` with both
+timestamps and all reserved bytes zero. Malformed requests and requests from
+devices outside the validated C6 table are ignored.
 
 The existing image callback still distinguishes timestamp provenance.
 `SERVER_TIME_P4_DETECTED` is a nonzero time carried by OPEN. If OPEN carries
@@ -151,8 +155,8 @@ editing source code. The output is `build/mesh_image_server.bin`.
 An ordinary ESP32-CAM is built with target `esp32`; this server does not start
 its camera peripheral or claim camera GPIOs. Console JPEGs and logs remain on
 UART0 (normally GPIO1 TX/GPIO3 RX) through the board's USB-to-UART adapter. Use
-a stable 5 V supply because simultaneous Wi-Fi and BLE radio activity can
-expose weak-power brownouts.
+a stable 5 V supply. The default serial-clock mode does not start Wi-Fi, so BLE
+does not share the 2.4 GHz radio with Wi-Fi scans or reconnects.
 
 Expected provisioning logs end with:
 
@@ -212,17 +216,51 @@ python -m pip install pyserial
 python firmware/server/tools/receive_images.py --port COM_SERVER --baud 921600 --output received_images
 ```
 
-To attach operator-friendly locations without adding radio or serial wire
-fields, copy and edit `tools/locations.example.json`, then add `--locations`:
+The same command starts a **PC-local** viewer at
+`http://127.0.0.1:8000/` and opens it in the default browser. The page is
+available immediately, shows a waiting state until the first complete JPEG is
+validated, and then refreshes automatically for every newly received image.
+It also exposes `GET /latest.jpg`, `GET /latest.json`, and
+`GET /status.json`. This HTTP server runs on the PC in the same process that
+owns the COM port; it does not enable ESP32 Wi-Fi and does not add BLE radio
+traffic.
+
+It also sends a 28-byte `BMTIME01` packet containing the laptop's current Unix
+milliseconds immediately after opening the COM port and every minute.
+The packet uses little-endian fields and CRC-32/IEEE; the ESP32 never parses
+typed text as time. Keep the laptop operating-system clock correct. Unix time
+is timezone-independent, while the browser renders it as Korea time (UTC+9).
+Use `--time-sync-interval 120` to select another 1..300-second interval or
+`--no-time-sync` for deliberate no-clock testing. The latter causes the server
+clock to expire after five minutes. Valid updates that overlap Mesh JPEG
+reassembly or console JPEG output are consumed but deliberately not applied.
+
+Use `--no-browser` when only the printed URL is wanted, `--http-port 8080` to
+select another local port, or `--no-http` for the old logs-and-files-only
+behavior. Binding remains loopback-only unless `--http-host` is explicitly
+changed.
+
+The saved result can also be previewed with no board or COM port connected:
 
 ```powershell
-Copy-Item firmware/server/tools/locations.example.json locations.json
+python firmware/server/tools/receive_images.py --view-only --output received_images
+```
+
+Operator-friendly locations do not add radio or serial fields. The receiver
+loads `tools/locations.json` by default; this installation currently maps C6
+ID 1 to `아차산`. Edit that file when a device moves. A different mapping can
+be selected with `--locations`:
+
+```powershell
 python firmware/server/tools/receive_images.py --port COM_SERVER --baud 921600 --output received_images --locations locations.json
 ```
 
 The JSON object is keyed by C6 device ID, for example
 `{"1":"front_entrance","2":"warehouse"}`. Moving a physical device only
 requires changing this PC-side file, not its firmware ID or Mesh registration.
+The browser always renders event and PC receive timestamps in the
+`Asia/Seoul` timezone (`KST`, UTC+9); the stored Unix milliseconds and UTC JSON
+fields are left unchanged. JPEG size is shown in KB using 1 KB = 1,024 bytes.
 
 Do **not** run `idf.py monitor` at the same time. A serial port can be opened by
 only one program, and the regular monitor does not understand the binary JPEG
@@ -239,10 +277,18 @@ receive time, and export sequence. Header/JPEG corruption is discarded and the
 scanner resynchronizes at the next magic. A global sequence gap is printed as
 a warning.
 
-## Wi-Fi/SNTP clock and optional HTTP exporter
+## Optional Wi-Fi/SNTP clock and firmware-side HTTP exporter
 
-For an ESP32-CAM server that continues sending JPEGs and logs through COM,
-leave `CONFIG_SERVER_SERIAL_IMAGE_ENABLE=y`, enable
+Laptop serial time is the default outdoor mode:
+
+```text
+CONFIG_SERVER_SERIAL_IMAGE_ENABLE=y
+CONFIG_SERVER_SERIAL_TIME_ENABLE=y
+CONFIG_SERVER_WIFI_SNTP_ENABLE=n
+```
+
+No SSID, Internet access, or firmware-side HTTP server is used. If Wi-Fi/SNTP
+is wanted instead, disable `CONFIG_SERVER_SERIAL_TIME_ENABLE`, enable
 `CONFIG_SERVER_WIFI_SNTP_ENABLE`, and set the SSID, password, and SNTP host in
 `idf.py menuconfig` under **Mesh image server**. Generated `sdkconfig` is
 git-ignored; do not put real credentials in tracked `sdkconfig.defaults` or
@@ -261,7 +307,9 @@ traffic is small, but AP scans and reconnects share the 2.4 GHz radio with BLE
 Mesh and can temporarily increase image latency. This does not use or conflict
 with the console UART.
 
-To use HTTP instead of COM image export, disable
+The following is a separate HTTP server running **on the ESP32**, not the
+PC-local viewer above. To use firmware-side HTTP instead of COM image export,
+disable
 `CONFIG_SERVER_SERIAL_IMAGE_ENABLE` and enable `CONFIG_SERVER_HTTP_ENABLE`.
 HTTP selects the same Wi-Fi/SNTP adapter automatically, copies the latest
 completed image, and exposes:
@@ -275,9 +323,10 @@ messages receive BUSY until the response ends, so the 30 KiB HTTP snapshot
 cannot race reassembly. JSON is small and remains available. HTTP does not own
 or restart Wi-Fi/SNTP, so there is only one network/time initialization path.
 
-Wi-Fi/SNTP and HTTP are disabled by default. ESP32-H2 can use the default
-console exporter, while custom Ethernet or storage integrations can still
-register the same callback API after disabling both built-in exporters.
+Wi-Fi/SNTP and firmware-side HTTP are disabled by default. ESP32-H2 can use the
+default console image/time path, while custom Ethernet or storage integrations
+can still register the same callback API after disabling the built-in
+adapters.
 
 ## Recovery test and host tests
 

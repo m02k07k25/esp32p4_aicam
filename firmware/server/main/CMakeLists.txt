@@ -17,6 +17,10 @@ if(CONFIG_SERVER_SERIAL_IMAGE_ENABLE)
     list(APPEND server_sources "server_serial_adapter.c")
 endif()
 
+if(CONFIG_SERVER_SERIAL_TIME_ENABLE)
+    list(APPEND server_sources "server_serial_time_adapter.c")
+endif()
+
 if(CONFIG_SERVER_WIFI_SNTP_ENABLE)
     list(APPEND server_sources "server_wifi_time_adapter.c")
 endif()
@@ -38,6 +42,10 @@ if(CONFIG_SERVER_WIFI_SNTP_ENABLE)
         esp_netif
         esp_wifi
         lwip)
+endif()
+
+if(CONFIG_SERVER_SERIAL_TIME_ENABLE)
+    idf_component_optional_requires(PRIVATE esp_driver_uart)
 endif()
 
 if(CONFIG_SERVER_HTTP_ENABLE)

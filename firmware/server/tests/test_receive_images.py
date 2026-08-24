@@ -10,6 +10,8 @@ import sys
 import tempfile
 import unittest
 from unittest import mock
+from urllib.error import HTTPError
+from urllib.request import urlopen
 
 
 sys.dont_write_bytecode = True
@@ -53,6 +55,47 @@ def frame(
         "<I", receive_images.crc32(header[:-4])
     )
     return header + image
+
+
+class LaptopTimePacketTest(unittest.TestCase):
+    def test_exact_little_endian_layout_and_crc(self) -> None:
+        unix_ms = 1_800_000_000_123
+        sequence = 0x12345678
+
+        wire = receive_images.encode_laptop_time_packet(unix_ms, sequence)
+        fields = receive_images.LAPTOP_TIME_STRUCT.unpack(wire)
+
+        self.assertEqual(len(wire), 28)
+        self.assertEqual(fields[0], b"BMTIME01")
+        self.assertEqual(fields[1], 1)
+        self.assertEqual(fields[2], 28)
+        self.assertEqual(fields[3], unix_ms)
+        self.assertEqual(fields[4], sequence)
+        self.assertEqual(
+            fields[5], receive_images.crc32(wire[:24])
+        )
+
+    def test_uart_sender_uses_current_time_and_wraps_sequence(self) -> None:
+        uart = mock.Mock()
+        uart.write.side_effect = lambda value: len(value)
+
+        with mock.patch.object(
+            receive_images.time, "time_ns", return_value=1_800_000_000_123_000_000
+        ):
+            next_sequence = receive_images._send_laptop_time(
+                uart, 0xFFFFFFFF
+            )
+
+        packet = uart.write.call_args.args[0]
+        fields = receive_images.LAPTOP_TIME_STRUCT.unpack(packet)
+        self.assertEqual(fields[3], 1_800_000_000_123)
+        self.assertEqual(fields[4], 0xFFFFFFFF)
+        self.assertEqual(next_sequence, 1)
+        uart.flush.assert_called_once_with()
+
+    def test_rejects_zero_sequence(self) -> None:
+        with self.assertRaises(ValueError):
+            receive_images.encode_laptop_time_packet(1_800_000_000_123, 0)
 
 
 class StreamParserTest(unittest.TestCase):
@@ -331,6 +374,76 @@ class ImageSinkTest(unittest.TestCase):
         parser = receive_images.ImageStreamParser(events.append)
         self.assertEqual(parser.feed(frame(jpeg(), source_addr=1)), [])
         self.assertTrue(any("managed C6" in event.message for event in events))
+
+
+class LocalImageViewerTest(unittest.TestCase):
+    def test_waiting_page_then_latest_image_and_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            viewer = receive_images.LocalImageViewer(
+                output, port=0, locations={1: "아차산"}
+            )
+            url = viewer.start()
+            try:
+                with urlopen(url, timeout=2) as response:
+                    page = response.read()
+                    self.assertEqual(response.status, 200)
+                    self.assertIn(b"BLE Mesh image receiver", page)
+                    self.assertIn("최신 사진".encode("utf-8"), page)
+                    self.assertIn("기기 정보".encode("utf-8"), page)
+                    self.assertIn("이벤트 정보".encode("utf-8"), page)
+                    self.assertIn(b' timeZone: "Asia/Seoul"', page)
+                    self.assertIn(b"item.jpeg_len / 1024", page)
+
+                with urlopen(url + "status.json", timeout=2) as response:
+                    waiting = json.loads(response.read())
+                self.assertFalse(waiting["image_available"])
+                self.assertIsNone(waiting["latest"])
+
+                with self.assertRaises(HTTPError) as missing:
+                    urlopen(url + "latest.jpg", timeout=2)
+                self.assertEqual(missing.exception.code, 404)
+
+                image = jpeg(b"served-by-local-http")
+                record = receive_images.ImageStreamParser().feed(
+                    frame(image, source_addr=0x0002, sequence=123)
+                )[0]
+                receive_images.ImageSink(output, {1: "entrance"}).save(record)
+
+                with urlopen(url + "status.json", timeout=2) as response:
+                    ready = json.loads(response.read())
+                self.assertTrue(ready["image_available"])
+                self.assertEqual(ready["latest"]["device_id"], 1)
+                self.assertEqual(ready["latest"]["location"], "아차산")
+                self.assertEqual(ready["latest"]["sequence"], 123)
+
+                with urlopen(url + "latest.jpg", timeout=2) as response:
+                    self.assertEqual(response.headers["Content-Type"], "image/jpeg")
+                    self.assertEqual(response.read(), image)
+                with urlopen(url + "latest.json", timeout=2) as response:
+                    latest = json.loads(response.read())
+                self.assertEqual(latest["jpeg_len"], len(image))
+            finally:
+                viewer.close()
+
+    def test_cli_enables_local_viewer_and_browser_by_default(self) -> None:
+        args = receive_images._parse_args(["--port", "COM_TEST"])
+
+        self.assertFalse(args.no_http)
+        self.assertFalse(args.no_browser)
+        self.assertFalse(args.no_time_sync)
+        self.assertEqual(args.time_sync_interval, 60.0)
+        self.assertEqual(args.http_host, "127.0.0.1")
+        self.assertEqual(args.http_port, 8000)
+        self.assertEqual(
+            args.locations, receive_images.DEFAULT_LOCATIONS_PATH
+        )
+
+    def test_view_only_does_not_require_a_serial_port(self) -> None:
+        args = receive_images._parse_args(["--view-only"])
+
+        self.assertTrue(args.view_only)
+        self.assertIsNone(args.port)
 
 
 if __name__ == "__main__":

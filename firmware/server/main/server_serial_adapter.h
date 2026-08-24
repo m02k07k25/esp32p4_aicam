@@ -1,6 +1,7 @@
 #ifndef SERVER_SERIAL_ADAPTER_H
 #define SERVER_SERIAL_ADAPTER_H
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #include "esp_err.h"
@@ -49,6 +50,9 @@ _Static_assert(sizeof(server_serial_frame_header_t) ==
 
 /* Initialize the fixed JPEG slot, stdout writer, and Mesh callback. */
 esp_err_t server_serial_adapter_init(void);
+
+/* True from callback enqueue until the complete JPEG record leaves stdout. */
+bool server_serial_adapter_is_transmitting(void);
 
 #ifdef __cplusplus
 }

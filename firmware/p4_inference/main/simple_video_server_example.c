@@ -38,7 +38,7 @@
 #define CAM_DEV_PATH                 ESP_VIDEO_MIPI_CSI_DEVICE_NAME
 #define JPEG_ENC_QUALITY             (80)
 #define EXAMPLE_MIPI_SCCB_RETRY_DELAY_MS 1000
-#define AUTO_INFER_PERIOD_MS          30000
+#define AUTO_INFER_PERIOD_MS          10000
 #define AUTO_INFER_TASK_STACK_SIZE    8192
 #define AUTO_INFER_TASK_PRIORITY      5
 #define AUTO_JPEG_MAX_QUALITY         60
@@ -613,13 +613,13 @@ static void run_periodic_inference(web_cam_t *wc, uint8_t *crop_rgb565)
     const int64_t start_us = esp_timer_get_time();
 
     if (xSemaphoreTake(wc->lock, pdMS_TO_TICKS(10000)) != pdTRUE) {
-        ESP_LOGW(TAG, "30-second inference skipped: camera lock timeout");
+        ESP_LOGW(TAG, "periodic inference skipped: camera lock timeout");
         return;
     }
 
     esp_err_t ret = dequeue_fresh_video_frame_locked(wc, &buf);
     if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "30-second inference failed to capture a fresh frame");
+        ESP_LOGW(TAG, "periodic inference failed to capture a fresh frame");
         xSemaphoreGive(wc->lock);
         return;
     }
@@ -633,7 +633,7 @@ static void run_periodic_inference(web_cam_t *wc, uint8_t *crop_rgb565)
     if (wc->pixel_format != EXAMPLE_VIDEO_FMT_RGB565 ||
         buf.bytesused < required_rgb565_size) {
         ESP_LOGW(TAG,
-                 "30-second inference got invalid RGB565 frame: format=%08" PRIx32
+                 "periodic inference got invalid RGB565 frame: format=%08" PRIx32
                  " bytes=%u expected=%u",
                  wc->pixel_format,
                  (unsigned int)buf.bytesused,
@@ -645,12 +645,12 @@ static void run_periodic_inference(web_cam_t *wc, uint8_t *crop_rgb565)
     ret = infer_bridge_process_rgb565(
         wc->buffer[buf.index], wc->width, wc->height, &infer_result);
     if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "30-second inference failed: %s", esp_err_to_name(ret));
+        ESP_LOGW(TAG, "periodic inference failed: %s", esp_err_to_name(ret));
         goto requeue_frame;
     }
 
     ESP_LOGI(TAG,
-             "30-second inference: class=%d (%s) score=%.4f inference=%.2f ms",
+             "periodic inference: class=%d (%s) score=%.4f inference=%.2f ms",
              infer_result.class_id,
              infer_result.class_name,
              infer_result.score,

@@ -68,6 +68,23 @@ static uint8_t s_pending_queue_storage[
 static uint32_t s_next_sequence = 1U;
 static portMUX_TYPE s_drop_lock = portMUX_INITIALIZER_UNLOCKED;
 static uint32_t s_dropped_images;
+static portMUX_TYPE s_transmit_lock = portMUX_INITIALIZER_UNLOCKED;
+static bool s_transmitting;
+
+static void set_transmitting(bool transmitting)
+{
+    portENTER_CRITICAL(&s_transmit_lock);
+    s_transmitting = transmitting;
+    portEXIT_CRITICAL(&s_transmit_lock);
+}
+
+bool server_serial_adapter_is_transmitting(void)
+{
+    portENTER_CRITICAL(&s_transmit_lock);
+    bool transmitting = s_transmitting;
+    portEXIT_CRITICAL(&s_transmit_lock);
+    return transmitting;
+}
 
 static void record_dropped_image(void)
 {
@@ -161,6 +178,7 @@ static void serial_writer_task(void *argument)
         }
 
         esp_err_t err = write_record(slot);
+        set_transmitting(false);
         uint32_t dropped = take_dropped_images();
         if (err == ESP_OK) {
             ESP_LOGI(TAG,
@@ -228,7 +246,9 @@ static void image_complete(const server_image_t *image, void *user_ctx)
     }
     memcpy(slot->jpeg, image->jpeg, image->jpeg_len);
 
+    set_transmitting(true);
     if (xQueueSend(s_pending_slots, &slot, 0) != pdTRUE) {
+        set_transmitting(false);
         (void)xQueueSend(s_free_slots, &slot, 0);
         record_dropped_image();
         return;

@@ -47,11 +47,12 @@ OV5647 800x800 RGB565 fresh frame
 
 ## 이벤트 시각
 
-ESP32-CAM Mesh 서버만 SNTP를 실행하며 P4 Ethernet은 HTTP용입니다. 서버와
-P4 사이의 시간 경로는 이미지 경로의 반대 방향으로 먼저 만들어집니다.
+노트북 Python 수신기가 ESP32-CAM Mesh 서버에 기준시각을 주며 P4 Ethernet은
+HTTP용입니다. 서버와 P4 사이의 시간 경로는 이미지 경로의 반대 방향으로 먼저
+만들어집니다.
 
 ```text
-ESP32-CAM SNTP authority
+Laptop OS clock → 28B server console-UART update
   → TIME_STATUS 0xCB(server RX/TX Unix ms)
   → C6
   → 40B SDIO TIME SAMPLE
@@ -75,9 +76,10 @@ Mesh 전송이 오래 걸려도 0이 아닌 timestamp는 변하지 않습니다.
 Mesh network header의 source address, 그 주소에서 역산한 `device_id`, timestamp와
 JPEG를 완성 이벤트로 제공합니다. 현재 출력 enum 이름
 `SERVER_TIME_P4_DETECTED`는 “P4가 frame에 붙인 capture time”이라는 뜻이며 그
-절대시각의 권위는 ESP32-CAM 서버입니다.
+절대시각의 권위는 노트북 표본을 받은 ESP32-CAM 서버입니다.
 
-서버 SNTP가 아직 유효하지 않으면 TIME_STATUS는 `UNAVAILABLE`과 두 개의 0
+서버가 아직 유효한 노트북 시각을 받지 못했거나 마지막 갱신 후 5분이 지나면
+TIME_STATUS는 `UNAVAILABLE`과 두 개의 0
 timestamp를 반환하고 P4는 frame time 0을 보냅니다. 반대로 서버 clock은
 유효하지만 P4 anchor만 없거나 만료되어 OPEN time이 0이면 서버는 최초 승인한
 OPEN 수신시각을 `SERVER_TIME_RX_ESTIMATE`로 고정합니다. 그 시점에도 서버
