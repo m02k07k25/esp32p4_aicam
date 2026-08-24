@@ -35,7 +35,7 @@ OV5647 800x800 RGB565 fresh frame
 ### 자동 이벤트 분기
 
 ```text
-30초 주기 + human + C6 READY
+10초 주기 + human + C6 READY
   → 최대 human score crop 선택
   → 정확히 224x224 RGB565
   → JPEG quality 60, 55, ... 20 순서로 encode

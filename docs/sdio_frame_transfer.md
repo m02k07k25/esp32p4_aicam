@@ -362,7 +362,7 @@ serial image를 끄고 `CONFIG_SERVER_SERIAL_IMAGE_ENABLE=n`,
 
 자동 이벤트 테스트:
 
-1. P4 카메라에 사람을 보여 주고 최대 30초 기다립니다.
+1. P4 카메라에 사람을 보여 주고 최대 10초 기다립니다.
 2. P4 monitor를 사용할 수 있으면 human crop, SDIO frame ID, `ACCEPTED`를 확인합니다.
 3. C6 monitor를 사용할 수 있으면 OPEN/ACCEPT, DATA, END를 확인합니다.
 4. Python console에서 device ID/location, source address, event time, JPEG length와 `IMAGE` 로그를 확인합니다.

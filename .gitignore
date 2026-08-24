@@ -14,6 +14,8 @@ model/artifacts/espdl/*.json
 !model/artifacts/espdl/classifier_224_p4.espdl.json
 model/artifacts/evaluation/*.csv
 model/data/calib/*
+model/data/finetune_train/
+model/data/finetune_exclude.txt
 model/data/train/*
 model/data/val/*
 model/data/test/*
@@ -48,3 +50,4 @@ firmware/p4_inference/dependencies.lock
 # Local serial captures and images received during hardware tests.
 live_*.log
 received_images/
+recovery/

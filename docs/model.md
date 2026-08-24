@@ -8,9 +8,14 @@
 python -m venv .venv
 & .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-pip install onnx pillow h5py esp-ppq ddgs
+python -m pip install -r requirements.txt
 ```
+
+이 저장소는 Python 3.12.9, PyTorch 2.11.0, torchvision 0.26.0,
+ONNX 1.17.0 및 ESP-PPQ 1.2.9 조합으로 검증했습니다. GPU 학습이 필요하면
+PyTorch 공식 설치 선택기에서 같은 public version의 CUDA wheel을 먼저 설치한
+뒤 `requirements.txt`를 적용합니다. 서버의 USB 로그/JPEG 수신기만 사용할
+경우에는 전체 ML 환경 대신 `pyserial==3.5`만 설치해도 됩니다.
 
 ## 권장 순서
 

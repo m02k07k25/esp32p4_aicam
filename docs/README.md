@@ -38,7 +38,7 @@ X-Inference-Time-Ms: 1342.50
 X-Inference-Total-Ms: 1362.10
 ```
 
-`/classify.jpg`는 조회 전용입니다. HTTP 호출은 SDIO 전송을 만들지 않습니다. 독립적인 30초 task가 fresh frame을 분류하고, 결과가 human이며 C6가 READY일 때 점수가 가장 높은 crop을 224×224 JPEG로 만들어 전송합니다.
+`/classify.jpg`는 조회 전용입니다. HTTP 호출은 SDIO 전송을 만들지 않습니다. 독립적인 10초 task가 fresh frame을 분류하고, 결과가 human이며 C6가 READY일 때 점수가 가장 높은 crop을 224×224 JPEG로 만들어 전송합니다.
 
 ### 검출시각
 

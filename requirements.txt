@@ -1,0 +1,22 @@
+# Tested with Python 3.12.9.
+# A CUDA-specific torch/torchvision wheel with the same public versions also
+# satisfies these pins. Select that wheel from https://pytorch.org/get-started/locally/
+# before installing this file when GPU training is required.
+
+# PC serial log/image receiver and laptop clock source
+pyserial==3.5
+
+# Model training and image preprocessing
+numpy==2.4.3
+Pillow==12.1.1
+torch==2.11.0
+torchvision==0.26.0
+h5py==3.16.0
+
+# ONNX export, evaluation, and ESP-DL quantization
+onnx==1.17.0
+onnxruntime==1.24.4
+esp-ppq==1.2.9
+
+# Optional web-image collector used by model/collect_mountain_dataset.py
+ddgs==9.15.0
